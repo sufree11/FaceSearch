@@ -177,7 +177,14 @@ def index_images(engine: FaceEngine, gallery: Gallery, *, force: bool = False,
         if captions:
             who = identified([(people[f.person_id], f.box) for f in faces if f.person_id],
                              img.shape[1], len(faces))
-            rec["description"] = llm.describe_image(img_path, who, rec["original_caption"] or "")
+            try:
+                rec["description"] = llm.describe_image(img_path, who, rec["original_caption"] or "")
+            except llm.OllamaError as e:
+                if "longer than" not in str(e):
+                    raise  # Ollama not running / model missing: stop
+                log(f"[{i}/{len(todo)}] {rel}: description timed out - using the source caption "
+                    "(fix later with: python cli.py redescribe --all)")
+                rec["description"] = rec["original_caption"] or ""
         else:
             rec["description"] = rec["original_caption"] or ""
 
@@ -193,10 +200,18 @@ def index_images(engine: FaceEngine, gallery: Gallery, *, force: bool = False,
     return count
 
 
-def redescribe(all_images: bool = False, log=print) -> int:
+PENDING_EMBED = config.DATA_DIR / "redescribe_pending.json"
+
+
+def redescribe(all_images: bool = False, force: bool = False, log=print) -> int:
     """Regenerate descriptions + embeddings for indexed photos (faces are kept).
 
-    By default only photos with a recognised person are redone.
+    - Only photos with a recognised person are redone (--all adds the rest).
+    - Photos whose description already names everyone recognised are skipped,
+      so running it again after a crash carries on where it stopped (--force redoes all).
+    - A photo that times out is skipped; run the command again to retry it.
+    - All descriptions are written first, then embedded together at the end,
+      so Ollama doesn't swap between the two models for every photo.
     """
     people = {p["id"]: p["name"] for p in load_people()}
     with store.connect() as con:
@@ -204,13 +219,32 @@ def redescribe(all_images: bool = False, log=print) -> int:
         faces = {}
         for f in con.execute("SELECT * FROM faces ORDER BY w * h DESC").fetchall():
             faces.setdefault(f["image_id"], []).append(f)
-    count = 0
-    for i, row in enumerate(rows, 1):
+
+    pending = set(json.loads(PENDING_EMBED.read_text())) if PENDING_EMBED.exists() else set()
+    todo, already = [], 0
+    for row in rows:
         fs = faces.get(row["id"], [])
         known = [(people[f["person_id"]], (f["x"], f["y"], f["w"], f["h"]))
                  for f in fs if f["person_id"] in people]
         if not known and not all_images:
             continue
+        desc = row["description"] or ""
+        if not force and row["id"] not in pending:
+            if known and all(llm._mentioned(n, desc) for n, _ in known):
+                already += 1
+                continue
+            if not known and desc:
+                already += 1
+                continue
+        if row["id"] in pending:
+            continue  # described in an earlier run, only needs embedding
+        todo.append((row, fs, known))
+    log(f"{len(todo)} photos to describe, {already} already fine"
+        + (f", {len(pending)} left to embed from last run" if pending else ""))
+
+    # 1) descriptions (vision model only)
+    done, failed, fails_in_a_row = 0, [], 0
+    for i, (row, fs, known) in enumerate(todo, 1):
         path = config.RAW_DIR / row["path"]
         if not path.exists():
             continue
@@ -219,16 +253,48 @@ def redescribe(all_images: bool = False, log=print) -> int:
             with Image.open(path) as im:
                 width = im.width
         who = identified(known, width, len(fs))
-        desc = llm.describe_image(path, who, row["original_caption"] or "")
+        try:
+            desc = llm.describe_image(path, who, row["original_caption"] or "")
+        except llm.OllamaError as e:
+            failed.append(row["path"])
+            fails_in_a_row += 1
+            log(f"[{i}/{len(todo)}] {row['path']}: SKIPPED ({e})")
+            if fails_in_a_row >= 3:
+                log("\nOllama failed 3 photos in a row - it may be stuck. Restart the Ollama app "
+                    "and run this command again; finished photos are kept.")
+                break
+            continue
+        fails_in_a_row = 0
         rec = {"description": desc, "original_caption": row["original_caption"], "title": row["title"]}
         doc = build_doc_text([n for n, _ in who], row["date"], rec)
-        emb = llm.embed([doc])[0]
+        with store.connect() as con:  # old embedding stays until step 2 replaces it
+            con.execute("UPDATE images SET description = ?, doc_text = ? WHERE id = ?",
+                        (desc, doc, row["id"]))
+        pending.add(row["id"])
+        PENDING_EMBED.write_text(json.dumps(sorted(pending)))
+        done += 1
+        log(f"[{i}/{len(todo)}] {row['path']}: {desc[:90]}...")
+
+    # 2) embeddings for everything described (embedding model only, in batches)
+    if pending:
+        log(f"\nEmbedding {len(pending)} descriptions...")
+        ids = sorted(pending)
         with store.connect() as con:
-            con.execute("UPDATE images SET description = ?, doc_text = ?, embedding = ? WHERE id = ?",
-                        (desc, doc, store.to_blob(emb), row["id"]))
-        count += 1
-        log(f"[{i}/{len(rows)}] {row['path']}: {desc[:90]}...")
-    return count
+            docs = {r["id"]: r["doc_text"] for r in con.execute(
+                f"SELECT id, doc_text FROM images WHERE id IN ({','.join('?' * len(ids))})", ids)}
+        for k in range(0, len(ids), 16):
+            batch = [i for i in ids[k:k + 16] if docs.get(i)]
+            vecs = llm.embed([docs[i] for i in batch])
+            with store.connect() as con:
+                con.executemany("UPDATE images SET embedding = ? WHERE id = ?",
+                                [(store.to_blob(v), i) for v, i in zip(vecs, batch)])
+            pending -= set(batch)
+            PENDING_EMBED.write_text(json.dumps(sorted(pending)))
+        PENDING_EMBED.unlink(missing_ok=True)
+
+    if failed:
+        log(f"\n{len(failed)} photo(s) skipped because Ollama was too slow. Run the command again to retry them.")
+    return done
 
 
 def relabel(gallery: Gallery, log=print) -> int:

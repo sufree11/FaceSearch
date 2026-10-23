@@ -28,7 +28,8 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 VISION_MODEL = os.getenv("FS_VISION_MODEL", "qwen2.5vl:3b")   # image descriptions
 CHAT_MODEL = os.getenv("FS_CHAT_MODEL", "qwen2.5:3b")         # chat answers
 EMBED_MODEL = os.getenv("FS_EMBED_MODEL", "bge-m3")           # multilingual text embeddings
-OLLAMA_TIMEOUT = int(os.getenv("FS_OLLAMA_TIMEOUT", 300))
+OLLAMA_TIMEOUT = int(os.getenv("FS_OLLAMA_TIMEOUT", 300))     # seconds per photo before skipping it
+OLLAMA_KEEP_ALIVE = os.getenv("FS_OLLAMA_KEEP_ALIVE", "30m")   # keep models loaded between photos
 
 # --- Search ---
 TOP_K = int(os.getenv("FS_TOP_K", 6))

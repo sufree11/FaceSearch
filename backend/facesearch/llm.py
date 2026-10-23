@@ -19,6 +19,8 @@ def _post(path: str, payload: dict, timeout: int | None = None) -> dict:
     try:
         r = requests.post(f"{config.OLLAMA_URL}{path}", json=payload,
                           timeout=timeout or config.OLLAMA_TIMEOUT)
+    except requests.Timeout as e:
+        raise OllamaError(f"Ollama took longer than {timeout or config.OLLAMA_TIMEOUT}s to answer.") from e
     except requests.ConnectionError as e:
         raise OllamaError("Ollama is not running. Start the Ollama app, then try again.") from e
     if r.status_code == 404 and "not found" in r.text:
@@ -85,6 +87,7 @@ def describe_image(path, people: list, context: str = "") -> str:
         "images": [_image_b64(path)],
         "stream": False,
         "options": {"temperature": 0.2},
+        "keep_alive": config.OLLAMA_KEEP_ALIVE,
     })
     text = out.get("response", "").strip()
     missing = [(n, w) for n, w in items if not _mentioned(n, text)]
@@ -96,7 +99,8 @@ def describe_image(path, people: list, context: str = "") -> str:
 
 def embed(texts: list[str]) -> np.ndarray:
     """Unit-normalised embeddings, shape (n, d)."""
-    out = _post("/api/embed", {"model": config.EMBED_MODEL, "input": texts})
+    out = _post("/api/embed", {"model": config.EMBED_MODEL, "input": texts,
+                               "keep_alive": config.OLLAMA_KEEP_ALIVE})
     vecs = np.asarray(out["embeddings"], dtype=np.float32)
     vecs /= np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-9
     return vecs

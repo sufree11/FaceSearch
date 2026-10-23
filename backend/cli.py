@@ -74,7 +74,7 @@ def cmd_relabel(_):
 
 def cmd_redescribe(a):
     from facesearch.indexer import redescribe
-    n = redescribe(all_images=a.all)
+    n = redescribe(all_images=a.all, force=a.force)
     print(f"\nRe-described {n} images.")
     try:
         requests.post("http://127.0.0.1:8000/api/reload", timeout=5)
@@ -120,6 +120,7 @@ def main():
     sub.add_parser("relabel").set_defaults(fn=cmd_relabel)
     r = sub.add_parser("redescribe", help="regenerate descriptions, keep faces")
     r.add_argument("--all", action="store_true", help="also photos with no recognised person")
+    r.add_argument("--force", action="store_true", help="redo photos that already look fine")
     r.set_defaults(fn=cmd_redescribe)
     sub.add_parser("evaluate").set_defaults(fn=cmd_evaluate)
     q = sub.add_parser("ask")

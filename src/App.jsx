@@ -17,7 +17,7 @@ function StatusPill({ health, error }) {
   if (missing.length) return <span className="status warn">Missing model: {missing.map((m) => m.name).join(', ')}</span>
   return (
     <span className="status ok">
-      Local AI ready · {index.images} photos · {index.known_faces} known faces
+      Local AI online
     </span>
   )
 }
