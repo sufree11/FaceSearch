@@ -2,7 +2,7 @@
 
 Chat with a photo archive. Ask *"Bagi gambar Tun Mahathir"* and FaceSearch returns photos of him, each with
 an AI-written description and its metadata (date, source, author, license). You can also upload a photo
-to find every archive photo with the same face.
+to find every archive photo with the same face, or browse the whole archive by person and year.
 
 Everything runs **locally**: no cloud APIs, and photos never leave the computer.
 
@@ -58,28 +58,48 @@ flowchart LR
    reference faces; at or above the threshold it counts as a match, otherwise "unknown".
 4. **Metadata**: the date comes from EXIF if present, otherwise from the source. Camera and GPS are read from
    EXIF when available.
-5. **Description**: the vision model describes the photo. It is told who face recognition found, so the
-   description uses real names instead of "a man in a suit".
+5. **Description**: the vision model describes the photo. It is told who face recognition found and where
+   each person is in the frame ("on the left"), so the description uses real names instead of "a man in a
+   suit". If the model still leaves a name out, it is added in front of the description.
 6. **Embedding**: names + date + description + source caption are combined into one text, embedded with
    `bge-m3` and saved to SQLite with the face boxes.
 
 ### Query (`/api/chat`)
 
 1. **Parse**: a rule-based parser finds the person (aliases, titles such as Tun/Datuk/Dr, and typos such as
-   "Mahatir") and years ("2018", "2015-2018", "selepas 2010", "1990s"). Rules are more predictable than a
-   small LLM for this step.
+   "Mahatir") and the years. Rules are more predictable than a small LLM for this step.
+
+   | Question says                                   | Years searched            |
+   | ----------------------------------------------- | ------------------------- |
+   | "2015", "dari tahun 2015", "from 2015"          | 2015 only                 |
+   | "2013-2015", "antara 2013 dan 2015"             | 2013 to 2015              |
+   | "2015 dan 2018"                                 | 2015 or 2018 (not between)|
+   | "sejak 2015" / "selepas 2015"                   | 2015+ / 2016+             |
+   | "sebelum 2010" / "hingga 2010"                  | up to 2009 / up to 2010   |
+   | "1990an", "1990s"                               | 1990 to 1999              |
+   | "tahun lepas", "tahun ini"                      | last year / this year     |
+
 2. **Retrieve**: keep photos where face recognition found that person (and match the years), then rank
    them by how similar the question is to each description. With no person, it is a pure semantic search
    ("people at a press conference"). Photos from the person's source folder whose face could not be
    confirmed (side profile, too small) are shown last and flagged.
 3. **Generate**: the local LLM gets only the retrieved photos' descriptions and metadata and writes a short
-   reply in the user's language, citing photos as [1], [2]. It is told never to invent dates.
+   reply in the user's language, citing photos as [1], [2]. It is told never to invent dates. The photos
+   appear first and the reply is **streamed word by word** (`/api/chat/stream`) as the model writes it.
+   If no photo matches the year, the reply lists the years that person does have photos from.
 4. **Follow-ups**: "yang tahun 2019 pula?" keeps the person from the previous question.
 
 ### Search by face (`/api/face-search`)
 
 Upload, paste or drop a photo. The largest face is compared with **every face in the archive**, not only the
 gallery, so it also finds people who are not in `people.json`.
+
+### All photos (`/api/images`)
+
+The **All photos** tab lists every indexed photo, filtered by person (including **Unidentified**: photos
+where nobody was recognised) and by year, sorted newest, oldest or recently added. Chat answers about one
+person link to it ("See all photos of …"). The Unidentified filter is a quick way to spot people that face
+recognition missed and add them to the gallery.
 
 ---
 
@@ -145,6 +165,8 @@ Open http://localhost:5173. The status pill at the top shows whether the backend
 - **Your own photos**: put them in any folder under `backend/data/raw/` (e.g. `data/raw/event-2026/`) and run
   `index`. Faces are recognised whatever folder they are in. EXIF dates are read automatically.
 - **Changed the gallery?** Run `python cli.py relabel` to re-identify stored faces without re-describing photos.
+- **Descriptions not naming people?** Run `python cli.py redescribe` to regenerate the AI descriptions
+  (faces are kept). Add `--all` to also redo photos with no recognised person.
 - `python cli.py index` reloads the running server when it finishes; otherwise call `POST /api/reload`.
 
 ## Settings
@@ -167,6 +189,8 @@ Environment variables (see `backend/facesearch/config.py`):
 | GET    | `/api/health`      | Ollama/model status, index counts           |
 | GET    | `/api/people`      | Known people with photo counts              |
 | POST   | `/api/chat`        | `{message, history}` → answer + photos      |
+| POST   | `/api/chat/stream` | Same, streamed as NDJSON: photos, then words, then done |
+| GET    | `/api/images`      | All photos; `?person=&year=&sort=&offset=&limit=` |
 | POST   | `/api/face-search` | multipart `file` → detected faces + photos  |
 | GET    | `/api/images/{id}` | One photo with full metadata                |
 | POST   | `/api/reload`      | Reload the index after indexing             |
@@ -179,9 +203,9 @@ Interactive docs: http://localhost:8000/docs
 ```
 FaceSearch/
 ├── src/                     React website
-│   ├── App.jsx              landing page, chat, face upload
+│   ├── App.jsx              landing page, chat, face upload, Search / All photos tabs
 │   ├── api.js               calls to the backend
-│   └── components/          Composer, Message, ImageCard, Lightbox, FaceBoxes, FaceThumb
+│   └── components/          Composer, Message, Browse, ImageCard, Lightbox, FaceBoxes, FaceThumb
 ├── vite.config.js           proxies /api and /media to the backend
 └── backend/
     ├── cli.py               pipeline commands
@@ -192,9 +216,9 @@ FaceSearch/
     │   ├── faces.py         YuNet + SFace, gallery matching
     │   ├── metadata.py      EXIF + date normalisation
     │   ├── llm.py           Ollama client (describe, chat, embed)
-    │   ├── indexer.py       gallery, indexing, relabel, evaluation
+    │   ├── indexer.py       gallery, indexing, relabel, redescribe, evaluation
     │   ├── parse.py         query understanding (person, years)
-    │   ├── search.py        retrieval + answer generation (RAG)
+    │   ├── search.py        retrieval + answer generation (RAG), browsing
     │   └── store.py         SQLite schema
     ├── models/              face models (downloaded, not in git)
     └── data/                photos, gallery, index.db (not in git)
