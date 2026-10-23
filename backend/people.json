@@ -1,0 +1,50 @@
+[
+  {
+    "id": "mahathir-mohamad",
+    "name": "Mahathir Mohamad",
+    "aliases": ["Tun Mahathir", "Tun Dr Mahathir", "Tun M", "Dr M", "Mahathir"],
+    "commons_category": "Mahathir Mohamad"
+  },
+  {
+    "id": "anwar-ibrahim",
+    "name": "Anwar Ibrahim",
+    "aliases": ["Datuk Seri Anwar", "Anwar"],
+    "commons_category": "Anwar Ibrahim"
+  },
+  {
+    "id": "najib-razak",
+    "name": "Najib Razak",
+    "aliases": ["Najib Tun Razak", "Datuk Seri Najib", "Najib"],
+    "commons_category": "Najib Razak"
+  },
+  {
+    "id": "muhyiddin-yassin",
+    "name": "Muhyiddin Yassin",
+    "aliases": ["Tan Sri Muhyiddin", "Muhyiddin"],
+    "commons_category": "Muhyiddin Yassin"
+  },
+  {
+    "id": "ismail-sabri-yaakob",
+    "name": "Ismail Sabri Yaakob",
+    "aliases": ["Ismail Sabri"],
+    "commons_category": "Ismail Sabri Yaakob"
+  },
+  {
+    "id": "abdullah-ahmad-badawi",
+    "name": "Abdullah Ahmad Badawi",
+    "aliases": ["Pak Lah", "Tun Abdullah", "Abdullah Badawi"],
+    "commons_category": "Abdullah Ahmad Badawi"
+  },
+  {
+    "id": "lee-chong-wei",
+    "name": "Lee Chong Wei",
+    "aliases": ["Datuk Lee Chong Wei", "Chong Wei", "Datuk Lee"],
+    "commons_category": "Lee Chong Wei"
+  },
+  {
+    "id": "siti-nurhaliza",
+    "name": "Siti Nurhaliza",
+    "aliases": ["Dato' Sri Siti Nurhaliza", "Tokti", "Siti", "Dato' Siti"],
+    "commons_category": "Siti Nurhaliza"
+  }
+]
