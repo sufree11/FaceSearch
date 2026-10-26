@@ -419,6 +419,16 @@
     border-radius: 6px;
     padding: 2px 7px;
   }
+  .new-badge {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    font: 600 11px var(--mono);
+    background: var(--accent);
+    color: #fff;
+    border-radius: 6px;
+    padding: 2px 7px;
+  }
   .flag {
     position: absolute;
     bottom: 8px;
@@ -774,4 +784,13 @@
   cursor: pointer;
 
   &:hover { text-decoration: underline; }
+}
+
+.pending-note {
+  font: italic 12px var(--mono);
+  color: var(--text);
+}
+
+.lightbox-info .pending-note {
+  margin: -2px 0 10px;
 }

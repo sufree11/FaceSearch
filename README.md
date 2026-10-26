@@ -94,6 +94,52 @@ flowchart LR
 Upload, paste or drop a photo. The largest face is compared with **every face in the archive**, not only the
 gallery, so it also finds people who are not in `people.json`.
 
+### Live search from Wikimedia Commons
+
+When the archive has fewer than 6 confirmed photos for a question about one person (for example a year
+it has nothing for), FaceSearch fetches more from Wikimedia Commons on the spot:
+
+1. `python cli.py catalog` has already recorded every Commons file for each person, with its date and
+   download link (no photos downloaded). So the live search knows instantly which files match the year.
+2. Up to 12 of those files are downloaded in parallel (25-second limit), files that name the person first.
+3. Each one goes through the face check (YuNet + SFace). Only photos where the person's face matches their
+   reference faces are shown; the rest are saved to the archive for other searches.
+4. The photos are shown straight away with the **Commons caption** as a temporary description
+   ("Commons caption · AI description pending"). A background thread in the server writes the AI
+   descriptions afterwards, pausing while someone is chatting, so the next search shows them.
+5. Everything is saved, so asking again is instant and doesn't fetch again.
+
+Without internet, or with `FS_LIVE_FETCH=0`, it silently uses the archive only. On a laptop CPU a live
+search adds roughly 5-15 seconds; describing each new photo in the background takes 20-90 seconds.
+Running `python cli.py catalog` again only does people not catalogued yet (e.g. after a failure); use
+`--refresh` now and then to pick up new uploads on Commons. Wikimedia throttles anonymous clients
+("429 Too Many Requests"); the command waits and retries, and setting `FS_WIKI_USER_AGENT` to something
+with your contact (e.g. `FaceSearch/0.1 (internship project; you@example.com)`) reduces it.
+
+### New public figures from Wikidata
+
+Ask for someone who isn't in `people.json` ("Bagi gambar Obama", "show me Joe Biden") and FaceSearch
+learns them on the spot:
+
+1. **Who is it?** The name is looked up on **Wikidata**. Only a *human* with a *Wikipedia article* is
+   accepted, i.e. a public figure, and every word you typed must match their name or an alias (so
+   "Obama" finds Barack Obama, not the Japanese city of Obama).
+2. **Learn the face.** From Wikidata come the official portrait (P18) and the Commons category. FaceSearch
+   searches Commons for photos tagged as *depicting* the person (their Wikidata id), adds their category,
+   downloads the portrait plus ~11 likely portraits, and keeps as reference faces the clear single-face
+   photos that match the portrait. Titles typed with the name ("Tunku Abdul Rahman") are searched first.
+3. **Save and search.** The person is added to `data/people_auto.json` (your `people.json` is untouched),
+   the photos are indexed, every face already in the archive is re-checked (so they're recognised in old
+   photos too), and the search runs as normal, including live search for more photos.
+
+The first question about a new person takes roughly 10-30 seconds; after that they're like anyone in
+`people.json`. Turn it off with `FS_AUTO_PEOPLE=0`. If it learned the wrong namesake, remove them with
+`python cli.py forget <id>` (ids are in `data/people_auto.json`; add `--delete-photos` to also delete
+their downloaded photos).
+
+Search **by face** (uploading a photo) still only searches your own archive: FaceSearch identifies
+people by name, never strangers from a photo.
+
 ### All photos (`/api/images`)
 
 The **All photos** tab lists every indexed photo, filtered by person (including **Unidentified**: photos
@@ -136,6 +182,7 @@ person, then run `python cli.py gallery` again. Recognition is only as good as t
 ```powershell
 python cli.py evaluate                   # accuracy on photos not in the gallery
 python cli.py index                      # faces -> descriptions -> embeddings
+python cli.py catalog                    # list Commons files + dates per person (for live search)
 python server.py                         # start the API on port 8000
 ```
 
@@ -168,6 +215,8 @@ Open http://localhost:5173. The status pill at the top shows whether the backend
 - **Descriptions not naming people?** Run `python cli.py redescribe` to regenerate the AI descriptions
   (faces are kept). Add `--all` to also redo photos with no recognised person.
 - `python cli.py index` reloads the running server when it finishes; otherwise call `POST /api/reload`.
+- **New person and live search:** after adding them to `people.json` and building their gallery, run
+  `python cli.py catalog --only <id>` so live search can fetch more of their photos.
 
 ## Settings
 
@@ -181,6 +230,11 @@ Environment variables (see `backend/facesearch/config.py`):
 | `FS_EMBED_MODEL`       | `bge-m3`       | Re-index with `--force` after changing             |
 | `FS_TOP_K`             | `6`            | Photos per answer                                  |
 | `FS_WIKI_USER_AGENT`   | generic        | Wikimedia asks for a contact in the user agent     |
+| `FS_LIVE_FETCH`        | `1`            | `0` turns off live search from Wikimedia Commons   |
+| `FS_AUTO_PEOPLE`       | `1`            | `0` stops learning new public figures from Wikidata |
+| `FS_LIVE_MAX`          | `12`           | Most photos downloaded per live search             |
+| `FS_LIVE_SECONDS`      | `25`           | Time limit for one live search                     |
+| `FS_BACKGROUND_DESCRIBE` | `1`          | `0` stops the server writing AI descriptions in the background |
 
 ## API
 
@@ -212,7 +266,10 @@ FaceSearch/
     ├── server.py            FastAPI app
     ├── people.json          who to recognise (names, aliases, Commons category)
     ├── facesearch/
-    │   ├── commons.py       Wikimedia Commons downloader
+    │   ├── commons.py       Wikimedia Commons downloader + catalog
+    │   ├── live.py          live search from Commons + background AI descriptions
+    │   ├── wikidata.py      finds a public figure by name on Wikidata
+    │   ├── onboard.py       learns a new person's face from Commons
     │   ├── faces.py         YuNet + SFace, gallery matching
     │   ├── metadata.py      EXIF + date normalisation
     │   ├── llm.py           Ollama client (describe, chat, embed)

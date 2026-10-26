@@ -112,4 +112,10 @@ def decode_image(raw: bytes) -> np.ndarray | None:
 
 
 def load_people() -> list[dict]:
-    return json.loads(config.PEOPLE_FILE.read_text(encoding="utf-8"))
+    """people.json (your list) + people learned on the fly from Wikidata (data/people_auto.json)."""
+    people = json.loads(config.PEOPLE_FILE.read_text(encoding="utf-8"))
+    if config.PEOPLE_AUTO_FILE.exists():
+        ids = {p["id"] for p in people}
+        people += [p for p in json.loads(config.PEOPLE_AUTO_FILE.read_text(encoding="utf-8"))
+                   if p["id"] not in ids]
+    return people

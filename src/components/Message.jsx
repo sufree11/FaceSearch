@@ -25,7 +25,9 @@ function PipelineInfo({ msg, onBrowse }) {
   const p = msg.parsed
   const bits = []
   if (p) {
-    bits.push(p.names?.length ? `person: ${p.names.join(' + ')}${p.inherited ? ' (from previous question)' : ''}` : 'person: none detected → semantic search')
+    if (p.names?.length) bits.push(`person: ${p.names.join(' + ')}${p.inherited ? ' (from previous question)' : ''}`)
+    else if (p.lookup && p.lookup_is_name) bits.push(`person: “${p.lookup}” (not found)`)
+    else bits.push('person: none detected → semantic search')
     if (p.years?.length > 1) {
       bits.push(`years: ${p.years.join(', ')}`)
     } else if (p.year_from || p.year_to) {
@@ -37,6 +39,10 @@ function PipelineInfo({ msg, onBrowse }) {
   bits.push(`${msg.images.length} photo${msg.images.length === 1 ? '' : 's'}`)
   if (msg.streaming) bits.push(`search ${msg.timing?.retrieve ?? 0}s · writing answer…`)
   else if (msg.timing) bits.push(`search ${msg.timing.retrieve}s · answer ${msg.timing.generate}s`)
+  if (p?.new_person) bits.push(`new person: ${p.new_person}, face learned from Wikidata + Commons`)
+  if (p?.lookup_error && !p.people?.length) bits.push(`lookup “${p.lookup}”: ${p.lookup_error}`)
+  if (msg.live?.added) bits.push(`+${msg.live.added} new from Wikimedia Commons`)
+  else if (msg.live?.reason?.includes('offline')) bits.push('Wikimedia Commons unreachable: archive only')
   if (msg.llm === false) bits.push('LLM offline – simple summary')
   const one = p?.people?.length === 1 ? p.people[0] : null
   return (
@@ -82,7 +88,7 @@ export default function Message({ msg, onOpen, onBrowse }) {
           <span />
           <span />
           <span />
-          {msg.text}
+          {msg.status || msg.text}
         </div>
       </div>
     )
@@ -95,7 +101,7 @@ export default function Message({ msg, onOpen, onBrowse }) {
           <span />
           <span />
           <span />
-          Writing answer…
+          {msg.status || 'Writing answer…'}
         </div>
       ) : (
         <AnswerText

@@ -16,7 +16,7 @@ import requests
 
 from . import config
 
-API = "https://commons.wikimedia.org/w/api.php"
+API = config.COMMONS_API
 OK_MIME = {"image/jpeg", "image/png", "image/webp"}
 TAG_RE = re.compile(r"<[^>]+>")
 
@@ -27,30 +27,84 @@ def _clean(value: str | None) -> str:
     return re.sub(r"\s+", " ", html.unescape(TAG_RE.sub(" ", value))).strip()
 
 
+CAT_REDIRECT_RE = re.compile(
+    r"\{\{\s*(?:Category redirect|Cat redirect|Categoryredirect|Seecat)\s*\|\s*(?:Category:)?([^|}]+)",
+    re.IGNORECASE)
+
+
 class Commons:
-    def __init__(self):
+    """Polite Wikimedia Commons API client.
+
+    - POST instead of GET, so long lists of file names don't hit "414 URI Too Long"
+    - at most ~1 request per second
+    - on "429 Too Many Requests" waits as long as Wikimedia asks (Retry-After), up to 6 tries
+    """
+
+    def __init__(self, delay: float = 1.0, log=print, api: str | None = None, patient: bool = True):
+        """patient=True (commands): wait out throttling for minutes.
+        patient=False (someone waiting in the chat): give up after a few seconds."""
         self.s = requests.Session()
         self.s.headers["User-Agent"] = config.WIKI_USER_AGENT
+        self.delay, self.log, self._last = delay, log, 0.0
+        self.api = api or API
+        self.tries, self.max_pause = (6, 120) if patient else (3, 10)
+        self.timeout = 60 if patient else 15
 
     def _get(self, **params) -> dict:
-        params |= {"action": "query", "format": "json", "formatversion": 2}
-        for attempt in range(4):
-            r = self.s.get(API, params=params, timeout=30)
-            if r.status_code == 429:
-                time.sleep(5 * (attempt + 1))
+        return self.request(action="query", formatversion=2, **params)
+
+    def request(self, **params) -> dict:
+        """Any MediaWiki API call (also used for Wikidata)."""
+        params |= {"format": "json"}
+        r = None
+        for attempt in range(self.tries):
+            wait = self.delay - (time.time() - self._last)
+            if wait > 0:
+                time.sleep(wait)
+            self._last = time.time()
+            r = self.s.post(self.api, data=params, timeout=self.timeout)
+            if r.status_code == 429 or r.status_code >= 500:
+                retry = r.headers.get("Retry-After", "")
+                pause = min(int(retry) if retry.isdigit() else 15 * (attempt + 1), self.max_pause)
+                self.log(f"  Wikimedia is busy ({r.status_code}), waiting {pause}s...")
+                time.sleep(pause)
                 continue
             r.raise_for_status()
             return r.json()
         r.raise_for_status()
         return {}
 
-    def category_files(self, category: str, depth: int = 1, limit: int = 200) -> list[str]:
-        """File titles in a category, including sub-categories up to `depth`."""
+    def resolve_category(self, names: list[str]) -> str | None:
+        """First of `names` that is a non-empty Commons category, following category redirects."""
+        for name in dict.fromkeys(n for n in names if n):
+            title = f"Category:{name}"
+            data = self._get(titles=title, prop="categoryinfo|revisions", rvprop="content", rvslots="main")
+            page = (data.get("query", {}).get("pages") or [{}])[0]
+            if page.get("missing"):
+                continue
+            rev = (page.get("revisions") or [{}])[0]
+            content = rev.get("slots", {}).get("main", {}).get("content", "") or rev.get("content", "")
+            m = CAT_REDIRECT_RE.search(content)
+            if m:
+                target = m.group(1).strip()
+                self.log(f"  category '{name}' redirects to '{target}'")
+                return target
+            info = page.get("categoryinfo", {})
+            if info.get("files", 0) or info.get("subcats", 0):
+                return name
+        return None
+
+    def category_files(self, category: str, depth: int = 1, limit: int = 200,
+                       max_cats: int | None = None) -> list[str]:
+        """File titles in a category, including sub-categories up to `depth`
+        (visiting at most `max_cats` categories, to keep the number of requests down)."""
         seen_cats, files, queue = set(), [], [(f"Category:{category}", 0)]
         while queue and len(files) < limit:
             cat, d = queue.pop(0)
             if cat in seen_cats:
                 continue
+            if max_cats and len(seen_cats) >= max_cats:
+                break
             seen_cats.add(cat)
             cont = {}
             while len(files) < limit:
@@ -65,6 +119,20 @@ class Commons:
                     break
                 cont = data["continue"]
         return files[:limit]
+
+    def depicts_files(self, qid: str, limit: int = 150) -> list[str]:
+        """Photos whose Commons structured data says they depict this Wikidata person (P180).
+        Far more complete than categories: famous people's photos sit deep in sub-categories."""
+        titles, offset = [], 0
+        while len(titles) < limit:
+            data = self._get(list="search", srsearch=f"haswbstatement:P180={qid} filetype:bitmap",
+                             srnamespace=6, srlimit=min(50, limit - len(titles)), sroffset=offset)
+            batch = [m["title"] for m in data.get("query", {}).get("search", [])]
+            titles += [t for t in batch if t not in titles]
+            if "continue" not in data or not batch:
+                break
+            offset = data["continue"].get("sroffset", offset + len(batch))
+        return titles[:limit]
 
     def search_files(self, query: str, limit: int = 100) -> list[str]:
         data = self._get(list="search", srsearch=query, srnamespace=6, srlimit=min(limit, 500))
@@ -97,10 +165,15 @@ class Commons:
 
 
 def safe_name(title: str) -> str:
+    """File name for a Commons title. Long titles are shortened with a short code from the full
+    title, so "... New Delhi (1).jpg" and "... New Delhi (2).jpg" don't end up with the same name."""
+    import hashlib
     stem, _, ext = title.rpartition(".")
-    stem = re.sub(r"[^\w\-]+", "_", stem, flags=re.UNICODE).strip("_")[:80]
+    clean = re.sub(r"[^\w\-]+", "_", stem, flags=re.UNICODE).strip("_")
+    if len(clean) > 80:
+        clean = clean[:70].rstrip("_") + "_" + hashlib.md5(title.encode("utf-8")).hexdigest()[:8]
     ext = ext.lower() if ext.lower() in ("jpg", "jpeg", "png", "webp") else "jpg"
-    return f"{stem}.{ext}"
+    return f"{clean}.{ext}"
 
 
 def download_person(person: dict, limit: int, width: int = 1024, depth: int = 1,
@@ -112,7 +185,9 @@ def download_person(person: dict, limit: int, width: int = 1024, depth: int = 1,
     meta_file = folder / "metadata.json"
     meta = json.loads(meta_file.read_text(encoding="utf-8")) if meta_file.exists() else {}
 
-    category = person.get("commons_category") or person["name"]
+    names = [person.get("commons_category"), person["name"],
+             *[a for a in person.get("aliases", []) if " " in a]]
+    category = c.resolve_category(names) or person.get("commons_category") or person["name"]
     titles = c.category_files(category, depth=depth, limit=limit * 2)
     if not titles:
         log(f"  no category '{category}', falling back to search")
@@ -141,3 +216,62 @@ def download_person(person: dict, limit: int, width: int = 1024, depth: int = 1,
         meta_file.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
         time.sleep(0.3)  # be polite to Wikimedia
     return got
+
+
+# --------------------------------------------------------------------------- catalog
+def catalog_path(person_id: str) -> Path:
+    return config.CATALOG_DIR / f"{person_id}.json"
+
+
+def build_catalog(person: dict, limit: int = 2000, width: int = 1024, depth: int = 1,
+                  min_side: int = 300, log=print, patient: bool = True, max_cats: int | None = None) -> dict:
+    """Record every Commons file for a person (title, download link, date, caption, license)
+    without downloading the photos. Live search uses it to know instantly which files
+    exist for a given year."""
+    from datetime import datetime, timezone
+
+    from .metadata import normalise_date
+    c = Commons(log=log, patient=patient)
+    if person.get("qid") and person.get("commons_category"):
+        # exact category from Wikidata: never fall back to the bare name, which may belong to a namesake
+        names = [person["commons_category"]]
+    else:
+        names = [person.get("commons_category"), person["name"],
+                 *[a for a in person.get("aliases", []) if " " in a]]
+    category = c.resolve_category(names) or person.get("commons_category") or person["name"]
+    titles = []
+    if person.get("qid"):  # photos tagged as depicting this person, then the category
+        titles = c.depicts_files(person["qid"], limit=limit)
+        log(f"  {len(titles)} photos tagged as depicting {person['name']}")
+    titles += [t for t in c.category_files(category, depth=depth, limit=max(0, limit - len(titles)),
+                                           max_cats=max_cats) if t not in titles]
+    if not titles:
+        log(f"  no category '{category}', falling back to search")
+        titles = c.search_files(person["name"], limit=min(limit, 500))
+    files = []
+    for info in c.file_info(titles, width):
+        if min(info["width"] or 0, info["height"] or 0) < min_side:
+            continue
+        date, year = normalise_date(info.get("date"))
+        files.append(info | {"file": safe_name(info["title"]), "norm_date": date, "year": year})
+    cat = {"person": person["id"], "category": category,
+           "updated": datetime.now(timezone.utc).isoformat(timespec="seconds"), "files": files}
+    catalog_path(person["id"]).write_text(json.dumps(cat, indent=1, ensure_ascii=False), encoding="utf-8")
+    return cat
+
+
+_catalog_cache: dict[str, tuple[float, dict]] = {}
+
+
+def load_catalog(person_id: str) -> dict | None:
+    """Catalog from disk, cached in memory until the file changes."""
+    p = catalog_path(person_id)
+    if not p.exists():
+        return None
+    mtime = p.stat().st_mtime
+    hit = _catalog_cache.get(person_id)
+    if hit and hit[0] == mtime:
+        return hit[1]
+    cat = json.loads(p.read_text(encoding="utf-8"))
+    _catalog_cache[person_id] = (mtime, cat)
+    return cat

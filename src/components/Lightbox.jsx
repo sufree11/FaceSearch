@@ -59,7 +59,10 @@ export default function Lightbox({ images, index, onClose, onMove }) {
           <button type="button" className="close" onClick={onClose} aria-label="Close">
             ×
           </button>
-          <h2>AI description</h2>
+          <h2>{image.desc_source === 'caption' ? 'Description (from Wikimedia Commons)' : 'AI description'}</h2>
+          {image.desc_source === 'caption' && (
+            <p className="pending-note">The AI description is being written in the background; search again later to see it.</p>
+          )}
           <p>{image.description || 'No description yet.'}</p>
           {image.original_caption && image.original_caption !== image.description && (
             <>

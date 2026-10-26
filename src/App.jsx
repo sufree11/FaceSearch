@@ -63,8 +63,23 @@ function App() {
       try {
         await api.chatStream(text, history, (ev) => {
           if (ev.type === 'results') {
-            // photos appear straight away; the reply is written underneath
-            replacePending({ role: 'assistant', text: '', images: ev.images, parsed: ev.parsed, timing: ev.timing, streaming: true })
+            // photos appear straight away; the reply is written underneath.
+            // A second "results" comes after a live fetch from Wikimedia Commons.
+            const update = { images: ev.images, parsed: ev.parsed, timing: ev.timing, live: ev.live, status: null }
+            if (ev.parsed?.new_person || ev.live?.added) {
+              // the archive just grew: refresh the people list and the status counts
+              api.people().then(setPeople).catch(() => {})
+              api.health().then(setHealth).catch(() => {})
+            }
+            setMessages((all) => {
+              const last = all[all.length - 1]
+              const next = last?.streaming
+                ? { ...last, ...update }
+                : { role: 'assistant', text: '', streaming: true, ...update }
+              return [...all.slice(0, -1), next]
+            })
+          } else if (ev.type === 'status') {
+            updateLast((m) => ({ ...m, status: ev.text }))
           } else if (ev.type === 'token') {
             updateLast((m) => ({ ...m, text: m.text + ev.text }))
           } else if (ev.type === 'done') {

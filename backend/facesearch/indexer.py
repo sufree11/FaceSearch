@@ -185,8 +185,10 @@ def index_images(engine: FaceEngine, gallery: Gallery, *, force: bool = False,
                 log(f"[{i}/{len(todo)}] {rel}: description timed out - using the source caption "
                     "(fix later with: python cli.py redescribe --all)")
                 rec["description"] = rec["original_caption"] or ""
+                rec["desc_source"] = "caption"
         else:
             rec["description"] = rec["original_caption"] or ""
+            rec["desc_source"] = "caption"
 
         # 4. embed for semantic search
         rec["doc_text"] = build_doc_text(names, date, rec)
@@ -229,7 +231,8 @@ def redescribe(all_images: bool = False, force: bool = False, log=print) -> int:
         if not known and not all_images:
             continue
         desc = row["description"] or ""
-        if not force and row["id"] not in pending:
+        temporary = row["desc_source"] == "caption"  # live-fetched, AI description still to come
+        if not force and row["id"] not in pending and not temporary:
             if known and all(llm._mentioned(n, desc) for n, _ in known):
                 already += 1
                 continue
@@ -268,7 +271,7 @@ def redescribe(all_images: bool = False, force: bool = False, log=print) -> int:
         rec = {"description": desc, "original_caption": row["original_caption"], "title": row["title"]}
         doc = build_doc_text([n for n, _ in who], row["date"], rec)
         with store.connect() as con:  # old embedding stays until step 2 replaces it
-            con.execute("UPDATE images SET description = ?, doc_text = ? WHERE id = ?",
+            con.execute("UPDATE images SET description = ?, doc_text = ?, desc_source = 'ai' WHERE id = ?",
                         (desc, doc, row["id"]))
         pending.add(row["id"])
         PENDING_EMBED.write_text(json.dumps(sorted(pending)))

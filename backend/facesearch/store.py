@@ -57,11 +57,20 @@ def connect():
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON")
     con.executescript(SCHEMA)
+    _migrate(con)
     try:
         yield con
         con.commit()
     finally:
         con.close()
+
+
+def _migrate(con):
+    """Add columns introduced after the first version, so old databases keep working."""
+    cols = {r[1] for r in con.execute("PRAGMA table_info(images)")}
+    if "desc_source" not in cols:
+        # 'ai' = written by the vision model, 'caption' = Commons caption, AI description still to come
+        con.execute("ALTER TABLE images ADD COLUMN desc_source TEXT")
 
 
 def to_blob(v: np.ndarray | None) -> bytes | None:
@@ -85,7 +94,7 @@ def known_hashes() -> dict[str, str]:
 def save_image(rec: dict, faces: list) -> int:
     cols = ["path", "folder", "phash", "width", "height", "date", "year", "date_source",
             "title", "original_caption", "description", "author", "license", "source_url",
-            "camera", "gps", "doc_text"]
+            "camera", "gps", "doc_text", "desc_source"]
     with connect() as con:
         con.execute("DELETE FROM images WHERE path = ?", (rec["path"],))
         cur = con.execute(
@@ -97,6 +106,13 @@ def save_image(rec: dict, faces: list) -> int:
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [(image_id, f.person_id, f.match_score, f.score, *f.box, to_blob(f.embedding)) for f in faces])
         return image_id
+
+
+def update_description(image_id: int, description: str, doc_text: str, embedding, source: str = "ai"):
+    with connect() as con:
+        con.execute("UPDATE images SET description = ?, doc_text = ?, embedding = COALESCE(?, embedding), "
+                    "desc_source = ? WHERE id = ?",
+                    (description, doc_text, to_blob(embedding), source, image_id))
 
 
 def image_record(row: sqlite3.Row, faces: list[sqlite3.Row], names: dict[str, str]) -> dict:
@@ -118,6 +134,7 @@ def image_record(row: sqlite3.Row, faces: list[sqlite3.Row], names: dict[str, st
         "camera": row["camera"],
         "gps": json.loads(row["gps"]) if row["gps"] else None,
         "folder": row["folder"],
+        "desc_source": row["desc_source"] if "desc_source" in row.keys() else None,
         "faces": [{
             "person_id": f["person_id"],
             "name": names.get(f["person_id"]) if f["person_id"] else None,

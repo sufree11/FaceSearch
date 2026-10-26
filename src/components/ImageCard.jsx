@@ -11,6 +11,7 @@ export default function ImageCard({ image, index, onOpen }) {
       <div className="image-card-media">
         <img src={image.url} alt={image.description || image.title || ''} loading="lazy" />
         {index != null && <span className="badge">{index}</span>}
+        {image.live && <span className="new-badge">New from Commons</span>}
         {image.match === 'source' && (
           <span className="flag" title="Labelled by the source; face not confirmed">
             face not confirmed
@@ -27,6 +28,7 @@ export default function ImageCard({ image, index, onOpen }) {
           {unknown > 0 && <span className="chip muted">+{unknown} unknown</span>}
         </div>
         <div className="date">{image.date || 'Date unknown'}</div>
+        {image.desc_source === 'caption' && <div className="pending-note">Commons caption · AI description pending</div>}
         {image.description && <p className="desc">{image.description}</p>}
       </div>
     </button>

@@ -18,6 +18,11 @@ app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http
 svc = SearchService()
 
 
+@app.on_event("startup")
+def start_background():
+    svc.start_background()  # AI descriptions for live-fetched photos
+
+
 class ChatIn(BaseModel):
     message: str
     history: list[dict] = []

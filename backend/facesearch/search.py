@@ -16,7 +16,7 @@ from collections import defaultdict
 
 import numpy as np
 
-from . import config, llm, parse, store
+from . import config, live, llm, onboard, parse, store, wikidata
 from .faces import FaceEngine, Gallery, decode_image, load_people
 from .indexer import load_gallery
 
@@ -35,7 +35,15 @@ class SearchService:
         self.lock = threading.Lock()
         self.engine: FaceEngine | None = None
         self.gallery: Gallery = Gallery()
+        self.describer: live.Describer | None = None
         self.reload()
+
+    def start_background(self):
+        """Server only: write AI descriptions for live-fetched photos in the background."""
+        if config.BACKGROUND_DESCRIBE and self.describer is None:
+            self.describer = live.Describer(on_change=self.reload)
+            self.describer.start()
+            self.describer.enqueue_pending()
 
     # ----------------------------------------------------------- loading
     def reload(self):
@@ -50,9 +58,11 @@ class SearchService:
             self.faces = defaultdict(list)
             for f in faces:
                 self.faces[f["image_id"]].append(f)
-            self.ids = [r["id"] for r in rows if r["embedding"] is not None]
-            self.emb = (np.stack([store.from_blob(self.rows[i]["embedding"]) for i in self.ids])
-                        if self.ids else np.zeros((0, 1), np.float32))
+            self.ids = [r["id"] for r in rows]
+            vecs = [store.from_blob(r["embedding"]) for r in rows]
+            dim = next((len(v) for v in vecs if v is not None), 0)
+            self.emb = (np.stack([v if v is not None else np.zeros(dim, np.float32) for v in vecs])
+                        if rows and dim else np.zeros((len(rows), 0), np.float32))
             self.face_rows = [f for f in faces if f["embedding"] is not None]
             self.face_emb = (np.stack([store.from_blob(f["embedding"]) for f in self.face_rows])
                              if self.face_rows else np.zeros((0, 128), np.float32))
@@ -96,19 +106,24 @@ class SearchService:
 
     # ----------------------------------------------------------- retrieval
     def retrieve(self, query: str, parsed: dict, k: int = config.TOP_K) -> list[dict]:
-        if not self.ids:
+        with self.lock:  # consistent snapshot: the background describer may reload meanwhile
+            ids, emb, rows, faces = self.ids, self.emb, self.rows, self.faces
+        if not ids:
             return []
-        try:
-            sem = self.emb @ llm.embed([query])[0]
-        except llm.OllamaError:
-            if not parsed["people"]:
-                raise
-            sem = np.zeros(len(self.ids), np.float32)  # still works by face alone
+        sem = np.zeros(len(ids), np.float32)  # without embeddings it still works by face
+        if emb.shape[1]:
+            try:
+                q = llm.embed([query])[0]
+                if len(q) == emb.shape[1]:
+                    sem = emb @ q
+            except llm.OllamaError:
+                if not parsed["people"] and not parsed.get("lookup_error"):
+                    raise
         want = set(parsed["people"])
         y0, y1 = parsed["year_from"], parsed["year_to"]
         hits = []
-        for idx, img_id in enumerate(self.ids):
-            row = self.rows[img_id]
+        for idx, img_id in enumerate(ids):
+            row = rows[img_id]
             year = row["year"]
             if (y0 or y1) and year is None:
                 continue
@@ -119,12 +134,15 @@ class SearchService:
                 continue
             face_score, match = 0.0, None
             if want:
-                matched = {f["person_id"]: f["match_score"] for f in self.faces[img_id]
+                matched = {f["person_id"]: f["match_score"] for f in faces[img_id]
                            if f["person_id"] in want}
                 if want <= matched.keys():          # every requested person is in the photo
                     match = "face"
                     face_score = float(np.mean(list(matched.values())))
-                elif row["folder"] in want and len(want) == 1:
+                elif (row["folder"] in want and len(want) == 1 and faces[img_id]
+                      and not any(f["person_id"] for f in faces[img_id])):
+                    # from the person's own folder, a face was found but not confirmed,
+                    # and nobody else was recognised (e.g. a side profile)
                     match = "source"                # labelled by the source, face not confirmed
                 else:
                     continue
@@ -149,9 +167,10 @@ class SearchService:
             people = ", ".join(f["name"] for f in im["faces"] if f["name"]) or "no recognised people"
             if im["match"] == "source":
                 people += " (face not confirmed; the photo comes from the requested person's source collection)"
+            label = "Description (Commons caption)" if im.get("desc_source") == "caption" else "Description"
             lines.append(
                 f"[{n}] People: {people}. Date: {im['date'] or 'unknown'}.\n"
-                f"    Description: {im['description'] or 'none'}\n"
+                f"    {label}: {im['description'] or 'none'}\n"
                 f"    Source caption: {(im['original_caption'] or 'none')[:300]}")
         return "\n".join(lines)
 
@@ -169,11 +188,9 @@ class SearchService:
             head += (f" Tarikh gambar: {span}." if malay else f" Dates: {span}.")
         return head
 
-    def _prepare(self, query: str, history: list[dict] | None):
-        """Steps 1-2 (parse + retrieve). Returns (parsed, images, seconds, answer-if-nothing-found)."""
-        t0 = time.time()
+    def _parse(self, query: str, history: list[dict] | None) -> dict:
+        """Step 1: who + which years. Follow-ups like "yang tahun 2019 pula?" keep the last person."""
         parsed = parse.parse(query, self.people)
-        # follow-ups like "yang tahun 2019 pula?" keep the person from the last turn
         if not parsed["people"] and history:
             last = next((h.get("parsed") for h in reversed(history) if h.get("parsed")), None)
             if last and last.get("people") and len(parse.norm(query).split()) <= 6 \
@@ -181,20 +198,103 @@ class SearchService:
                 parsed["people"] = last["people"]
                 parsed["inherited"] = True
         parsed["names"] = [self.names[p] for p in parsed["people"]]
+        if not parsed["people"] and config.AUTO_PEOPLE:
+            name = parse.candidate_name(query)  # someone not in the list?
+            if name:
+                parsed["lookup"] = name
+                parsed["lookup_titled"] = parse.candidate_name_with_titles(query, name)
+                parsed["lookup_hints"] = parse.role_hints(query)
+                parsed["lookup_is_name"] = parse.looks_like_name(query, name)
+        return parsed
 
-        images = self.retrieve(query, parsed)
-        no_result = None
-        if not images:
-            who = " / ".join(parsed["names"])
-            if parsed["people"] and not any(p in self.gallery.people for p in parsed["people"]):
-                no_result = (f"{who} has no reference faces yet. Add photos to data/gallery/"
-                             f"{parsed['people'][0]}/ and run `python cli.py gallery` then `python cli.py relabel`.")
-            elif parsed["people"] and (parsed["year_from"] or parsed["year_to"]):
-                no_result = self._no_year_message(parsed)
-            else:
-                no_result = ("Maaf, tiada gambar yang sepadan dalam arkib. / "
-                             "Sorry, no matching photos in the archive.")
-        return parsed, images, round(time.time() - t0, 2), no_result
+    def _resolve_unknown(self, parsed: dict):
+        """Generator: look up an unknown name on Wikidata and learn their face if needed.
+        Yields status texts; updates `parsed` in place."""
+        name = parsed.get("lookup")
+        if not name:
+            return
+        yield f"Looking up “{name}” on Wikidata…"
+        try:
+            hints, years = parsed.get("lookup_hints", []), (parsed.get("year_from"), parsed.get("year_to"))
+            wd = None
+            if parsed.get("lookup_titled"):  # "tunku abdul rahman" before plain "abdul rahman"
+                wd = wikidata.lookup(parsed["lookup_titled"], hints, years)
+            wd = wd or wikidata.lookup(name, hints, years)
+        except Exception:
+            parsed["lookup_error"] = "could not reach Wikidata"
+            return
+        if not wd:
+            parsed["lookup_error"] = "not on Wikidata"
+            return
+        known = next((p for p in self.people if p.get("qid") == wd["qid"]), None)
+        if known:
+            pid = known["id"]
+        else:
+            desc = f" ({wd['description']})" if wd.get("description") else ""
+            yield f"Found {wd['name']}{desc}. Learning their face from Wikimedia Commons…"
+            try:
+                pid = onboard.learn(self, wd)
+            except onboard.OnboardError as e:
+                parsed["lookup_error"] = f"{e} (tried: {wd['name']}{desc})"
+                return
+            parsed["new_person"] = wd["name"]
+        parsed["people"] = [pid]
+        parsed["names"] = [self.names.get(pid, wd["name"])]
+
+    @staticmethod
+    def _unknown_name(parsed: dict) -> bool:
+        """A clearly named person ("Anne Hathaway") we couldn't find or learn: say so instead of
+        showing unrelated photos from a meaning-based search."""
+        return bool(parsed.get("lookup_error") and parsed.get("lookup_is_name") and not parsed["people"])
+
+    def _no_result(self, parsed: dict, images: list[dict]) -> str | None:
+        if images:
+            return None
+        if parsed.get("lookup_error") == "not on Wikidata" and not parsed["people"]:
+            return (f"Maaf, tiada gambar yang sepadan dalam arkib, dan tiada tokoh awam bernama "
+                    f"“{parsed['lookup']}” di Wikidata.\nSorry, no matching photos in the archive, and no "
+                    f"public figure called “{parsed['lookup']}” on Wikidata.")
+        if parsed.get("lookup_error") and not parsed["people"]:
+            return (f"Maaf, saya tidak dapat mencari “{parsed['lookup']}”: {parsed['lookup_error']}.\n"
+                    f"Sorry, I couldn't search for “{parsed['lookup']}”: {parsed['lookup_error']}.")
+        who = " / ".join(parsed["names"])
+        if parsed["people"] and not any(p in self.gallery.people for p in parsed["people"]):
+            return (f"{who} has no reference faces yet. Add photos to data/gallery/"
+                    f"{parsed['people'][0]}/ and run `python cli.py gallery` then `python cli.py relabel`.")
+        if parsed["people"] and (parsed["year_from"] or parsed["year_to"]):
+            return self._no_year_message(parsed)
+        return ("Maaf, tiada gambar yang sepadan dalam arkib. / "
+                "Sorry, no matching photos in the archive.")
+
+    def _live_person(self, parsed: dict, images: list[dict]) -> str | None:
+        """Person to fetch live photos for, or None: one known person, fewer than TOP_K
+        confirmed photos, reference faces to check against, and new files in the catalog."""
+        if not config.LIVE_FETCH or len(parsed["people"]) != 1:
+            return None
+        pid = parsed["people"][0]
+        if pid not in self.gallery.people:
+            return None
+        if sum(1 for im in images if im["match"] == "face") >= config.TOP_K:
+            return None
+        person = next((p for p in self.people if p["id"] == pid), None)
+        return pid if person and live.candidates(person, parsed) else None
+
+    def _live(self, query: str, parsed: dict, images: list[dict], pid: str):
+        need = config.TOP_K - sum(1 for im in images if im["match"] == "face")
+        info = live.fetch(self, pid, parsed, need)
+        if info["new_ids"]:
+            self.reload()
+            if self.describer:
+                self.describer.enqueue(info["new_ids"])
+            images = self.retrieve(query, parsed)
+        new = set(info["new_ids"])
+        for im in images:
+            im["live"] = im["id"] in new
+        return images, {"added": info["added"], "checked": info["checked"], "reason": info["reason"]}
+
+    def _touch(self):
+        if self.describer:
+            self.describer.last_chat = time.time()
 
     def _no_year_message(self, parsed: dict) -> str:
         """No photo in the asked years: say which years this person does have."""
@@ -219,9 +319,20 @@ class SearchService:
                 {"role": "user", "content": f"Photos found:\n{self._context(images)}\n\nUser request: {query}"}]
 
     def chat(self, query: str, history: list[dict] | None = None) -> dict:
-        parsed, images, t_retrieve, no_result = self._prepare(query, history)
+        self._touch()
+        t0 = time.time()
+        parsed = self._parse(query, history)
+        for _ in self._resolve_unknown(parsed):
+            pass
+        images = [] if self._unknown_name(parsed) else self.retrieve(query, parsed)
+        live_info = None
+        pid = self._live_person(parsed, images)
+        if pid:
+            images, live_info = self._live(query, parsed, images, pid)
+        t_retrieve = round(time.time() - t0, 2)
+        no_result = self._no_result(parsed, images)
         if no_result:
-            return {"answer": no_result, "images": [], "parsed": parsed,
+            return {"answer": no_result, "images": [], "parsed": parsed, "live": live_info,
                     "timing": {"retrieve": t_retrieve, "generate": 0}, "llm": False}
         t1 = time.time()
         used_llm = True
@@ -229,19 +340,37 @@ class SearchService:
             answer = llm.chat(self._messages(query, images))
         except llm.OllamaError:
             answer, used_llm = self._fallback_answer(query, parsed, images), False
-        return {"answer": answer, "images": images, "parsed": parsed, "llm": used_llm,
+        self._touch()
+        return {"answer": answer, "images": images, "parsed": parsed, "llm": used_llm, "live": live_info,
                 "timing": {"retrieve": t_retrieve, "generate": round(time.time() - t1, 2)}}
 
     def chat_stream(self, query: str, history: list[dict] | None = None):
         """Same as chat(), but as events: the photos first, then the reply word by word.
 
-        {"type": "results", images, parsed, timing}  -> show the photo cards straight away
-        {"type": "token", "text": "..."}             -> append to the reply (repeated)
-        {"type": "done", answer, llm, timing}        -> final full reply
+        {"type": "results", images, parsed, timing, live}  -> show the photo cards straight away
+        {"type": "status", "text": "..."}                    -> e.g. "Fetching more photos..."
+        {"type": "results", ...}                             -> again, with the live photos added
+        {"type": "token", "text": "..."}                     -> append to the reply (repeated)
+        {"type": "done", answer, llm, timing}                -> final full reply
         """
-        parsed, images, t_retrieve, no_result = self._prepare(query, history)
-        yield {"type": "results", "images": images, "parsed": parsed,
+        self._touch()
+        t0 = time.time()
+        parsed = self._parse(query, history)
+        for text in self._resolve_unknown(parsed):
+            yield {"type": "status", "text": text}
+        images = [] if self._unknown_name(parsed) else self.retrieve(query, parsed)
+        live_info = None
+        pid = self._live_person(parsed, images)
+        if pid:
+            # show what the archive has now, then look for more
+            yield {"type": "results", "images": images, "parsed": parsed, "live": {"pending": True},
+                   "timing": {"retrieve": round(time.time() - t0, 2), "generate": 0}}
+            yield {"type": "status", "text": f"Fetching more photos of {self.names[pid]} from Wikimedia Commons…"}
+            images, live_info = self._live(query, parsed, images, pid)
+        t_retrieve = round(time.time() - t0, 2)
+        yield {"type": "results", "images": images, "parsed": parsed, "live": live_info,
                "timing": {"retrieve": t_retrieve, "generate": 0}}
+        no_result = self._no_result(parsed, images)
         if no_result:
             yield {"type": "done", "answer": no_result, "llm": False,
                    "timing": {"retrieve": t_retrieve, "generate": 0}}
@@ -259,6 +388,7 @@ class SearchService:
                 answer = "".join(parts).strip()
             else:
                 answer, used_llm = self._fallback_answer(query, parsed, images), False
+        self._touch()
         yield {"type": "done", "answer": answer, "llm": used_llm,
                "timing": {"retrieve": t_retrieve, "generate": round(time.time() - t1, 2)}}
 

@@ -22,6 +22,8 @@ STOP = {
     "nak", "mahu", "please", "tolong", "sila", "yang", "ada", "semua", "all", "some",
     "tahun", "year", "years", "from", "dari", "daripada", "to", "hingga", "sampai",
     "sebelum", "before", "selepas", "after", "since", "sejak", "antara", "between", "lepas",
+    "give", "get", "want", "need", "can", "could", "would", "you", "i", "like", "send", "hantar",
+    "boleh", "tak", "any", "some", "more", "lagi", "mana", "apa", "is", "are", "there", "his", "her",
 }
 FUZZY_MIN = 0.84
 
@@ -113,6 +115,80 @@ def find_years(query: str, this_year: int | None = None) -> dict:
         out["years"] = years
         return rng(years[0], years[-1])
     return out
+
+
+REQUEST_WORDS = {"gambar", "foto", "photo", "photos", "picture", "pictures", "image", "images",
+                 "pic", "pics", "show", "tunjuk", "tunjukkan", "bagi", "beri", "cari", "carikan", "find"}
+GENERIC = {"orang", "people", "person", "man", "woman", "lelaki", "perempuan", "budak", "kanak", "crowd",
+           "group", "ramai", "family", "keluarga", "kucing", "cat", "dog", "anjing", "bangunan", "building"}
+
+
+# Words that describe someone rather than name them ("the actress Anne Hathaway").
+# Removed from the Wikidata search, then used to pick the right person among namesakes.
+ROLES = {
+    "actress": ["actress"], "actor": ["actor"], "aktor": ["actor"], "aktres": ["actress"],
+    "pelakon": ["actor", "actress"], "singer": ["singer"], "penyanyi": ["singer"],
+    "artis": ["singer", "actor", "actress", "artist"], "artist": ["artist", "singer"],
+    "musician": ["musician"], "rapper": ["rapper"], "model": ["model"],
+    "president": ["president"], "presiden": ["president"], "politician": ["politician"],
+    "ahli": ["politician"], "politik": ["politician"], "footballer": ["footballer"],
+    "player": ["player"], "pemain": ["player", "footballer"], "bola": ["footballer"],
+    "athlete": ["athlete"], "atlet": ["athlete"], "badminton": ["badminton"],
+    "ceo": ["businessman", "executive"], "founder": ["businessman", "founder"],
+    "pengasas": ["founder"], "writer": ["writer"], "penulis": ["writer"], "author": ["writer"],
+    "scientist": ["scientist"], "saintis": ["scientist"], "youtuber": ["youtuber"],
+    "celebrity": [], "selebriti": [], "famous": [], "terkenal": [], "former": [], "bekas": [],
+    "american": ["american"], "british": ["british"], "malaysian": ["malaysian"],
+    "indonesian": ["indonesian"], "singaporean": ["singaporean"], "korean": ["korean"],
+}
+
+
+def role_hints(query: str) -> list[str]:
+    """Description words to prefer among namesakes, e.g. "actress" for "the actress Anne Hathaway"."""
+    return [w for t in norm(query).split() for w in ROLES.get(t, [])]
+
+
+def looks_like_name(query: str, name: str) -> bool:
+    """True if the user wrote the name with capital letters ("Anne Hathaway"), so it's clearly a
+    person and showing unrelated photos would be wrong. "pasar malam" stays a description."""
+    words = re.findall(r"[^\W\d_][\w'’-]*", query)
+    caps = {norm(w) for w in words[1:] if w[0].isupper()}  # skip the first word of the sentence
+    return any(t in caps for t in name.split())
+
+
+# Titles that belong to the name on Wikidata ("Tunku Abdul Rahman", "Tun Razak"); searched with first
+NAME_TITLES = {"tunku", "tengku", "tun", "tan", "sri", "seri", "dato", "datuk", "haji", "sultan",
+               "raja", "sir", "dr"}
+
+
+def candidate_name_with_titles(query: str, name: str) -> str | None:
+    """`name` with the titles the user typed in front of it: "Tunku Abdul Rahman" -> "tunku abdul rahman".
+    None if there were no such titles."""
+    toks = norm(query).split()
+    first = name.split()[0]
+    if first not in toks:
+        return None
+    i = toks.index(first)
+    titles = []
+    while i > 0 and toks[i - 1] in NAME_TITLES:
+        titles.insert(0, toks[i - 1])
+        i -= 1
+    return " ".join(titles + [name]) if titles else None
+
+
+def candidate_name(query: str) -> str | None:
+    """A name to look up on Wikidata, for photo requests about someone not in the list.
+    "Bagi gambar Obama tahun 2015" -> "obama";  "people at a party" -> None (not a photo request)."""
+    toks = norm(query).split()
+    if not REQUEST_WORDS & set(toks):
+        return None
+    rest = [t for t in toks if t not in STOP and t not in TITLES and t not in REQUEST_WORDS
+            and t not in GENERIC and not re.fullmatch(r"\d+|\d{4}(s|an)?", t)
+            and t not in ROLES
+            and t not in ("pula", "lagi", "sahaja", "saja", "je", "please", "thanks", "terima", "kasih")]
+    if not rest or len(rest) > 4:
+        return None  # nothing left, or a description rather than a name
+    return " ".join(rest)
 
 
 def parse(query: str, people: list[dict]) -> dict:
