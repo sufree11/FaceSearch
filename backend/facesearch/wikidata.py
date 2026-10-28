@@ -52,17 +52,19 @@ def _commons_category(entity: dict) -> str | None:
     return _claim(entity, "P373")
 
 
-def lookup(name: str, hints: list[str] | tuple = (), years: tuple | None = None) -> dict | None:
+def lookup(name: str, hints: list[str] | tuple = (), years: tuple | None = None,
+           patient: bool = False) -> dict | None:
     """{qid, name, description, aliases, commons_category, image} or None. Cached per session.
 
     Among people with the same name it prefers, in order: a description that fits `hints`
     (e.g. "actress"), being alive in the asked `years` (year_from, year_to), having a portrait,
-    and being the most widely known (Wikipedia articles in the most languages)."""
+    and being the most widely known (Wikipedia articles in the most languages).
+    Raises commons.WikimediaBusy if Wikimedia is rate-limiting us and `patient` is False."""
     y0, y1 = years or (None, None)
     key = f"{parse.norm(name)}|{','.join(hints)}|{y0}-{y1}"
     if key in _cache:
         return _cache[key]
-    wd = Commons(api=config.WIKIDATA_API, delay=0.5, log=lambda *a: None, patient=False)
+    wd = Commons(api=config.WIKIDATA_API, delay=0.5, log=lambda *a: None, patient=patient)
     ids = []
     for lang in ("en", "ms"):
         res = wd.request(action="wbsearchentities", search=name, language=lang, uselang="en",

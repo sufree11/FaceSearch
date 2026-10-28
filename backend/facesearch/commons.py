@@ -9,6 +9,7 @@ from __future__ import annotations
 import html
 import json
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from . import config
 API = config.COMMONS_API
 OK_MIME = {"image/jpeg", "image/png", "image/webp"}
 TAG_RE = re.compile(r"<[^>]+>")
+IMAGEINFO = "url|size|mime|extmetadata"
 
 
 def _clean(value: str | None) -> str:
@@ -32,23 +34,60 @@ CAT_REDIRECT_RE = re.compile(
     re.IGNORECASE)
 
 
+class WikimediaBusy(requests.HTTPError):
+    """Wikimedia asked us to slow down (HTTP 429/503 with Retry-After) and the caller can't wait."""
+
+    def __init__(self, status: int, retry_after: float):
+        self.status, self.retry_after = status, max(1, round(retry_after))
+        super().__init__(f"Wikimedia is limiting requests from this connection (HTTP {status}); "
+                         f"try again in about {self.retry_after} s")
+
+
+# Wikimedia's API rate limits (2026) are shared by every wiki: a 503 from Commons means Wikidata
+# is limiting us too. One pace for the whole app, so the chat doesn't knock while the background
+# learner is already retrying.
+#
+# What Retry-After means in practice (measured from a throttled home connection, Oct 2026): it
+# counts down to the end of the minute, but about 1 request in 4 gets through at any moment
+# during the countdown. Waiting out the whole countdown after every refusal made learning a new
+# person take 8+ minutes and often fail; retrying every RETRY_PACE seconds (10 requests a minute,
+# far below the 200/min allowed to an identified client) gets each request through in ~25 s.
+RETRY_PACE = 6
+_cooldown = {"until": 0.0, "status": 0}
+_cooldown_lock = threading.Lock()
+
+
+def cooldown_left() -> float:
+    return max(0.0, _cooldown["until"] - time.time())
+
+
+def _start_cooldown(status: int, seconds: float):
+    with _cooldown_lock:
+        _cooldown["until"] = max(_cooldown["until"], time.time() + seconds)
+        _cooldown["status"] = status
+
+
 class Commons:
-    """Polite Wikimedia Commons API client.
+    """Polite Wikimedia API client (Commons, and Wikidata via `api=`).
 
     - POST instead of GET, so long lists of file names don't hit "414 URI Too Long"
     - at most ~1 request per second
-    - on "429 Too Many Requests" waits as long as Wikimedia asks (Retry-After), up to 6 tries
+    - when refused (429/503) retries at a steady, slow pace (see RETRY_PACE)
     """
 
     def __init__(self, delay: float = 1.0, log=print, api: str | None = None, patient: bool = True):
-        """patient=True (commands): wait out throttling for minutes.
-        patient=False (someone waiting in the chat): give up after a few seconds."""
+        """patient=True (commands, background learning): keep retrying for up to ~7 minutes per
+        request. patient=False (someone waiting in the chat): one quick retry, then raise
+        WikimediaBusy so the chat can hand the work to the background learner."""
         self.s = requests.Session()
         self.s.headers["User-Agent"] = config.WIKI_USER_AGENT
         self.delay, self.log, self._last = delay, log, 0.0
         self.api = api or API
-        self.tries, self.max_pause = (6, 120) if patient else (3, 10)
+        self.patient = patient
+        self.tries = 40 if patient else 2
+        self.pace = RETRY_PACE if patient else 2   # seconds between retries
         self.timeout = 60 if patient else 15
+        self.refused = 0  # requests Wikimedia turned down (shown as progress)
 
     def _get(self, **params) -> dict:
         return self.request(action="query", formatversion=2, **params)
@@ -58,17 +97,29 @@ class Commons:
         params |= {"format": "json"}
         r = None
         for attempt in range(self.tries):
+            left = cooldown_left()
+            if left > self.pace:  # someone else is already retrying; the chat shouldn't wait
+                raise WikimediaBusy(_cooldown["status"], left)
+            if left > 0:
+                time.sleep(left)
             wait = self.delay - (time.time() - self._last)
             if wait > 0:
                 time.sleep(wait)
             self._last = time.time()
             r = self.s.post(self.api, data=params, timeout=self.timeout)
             if r.status_code == 429 or r.status_code >= 500:
+                self.refused += 1
                 retry = r.headers.get("Retry-After", "")
-                pause = min(int(retry) if retry.isdigit() else 15 * (attempt + 1), self.max_pause)
-                self.log(f"  Wikimedia is busy ({r.status_code}), waiting {pause}s...")
-                time.sleep(pause)
-                continue
+                told = int(retry) if retry.isdigit() else 0
+                seconds = self.pace if told else min(5 * (attempt + 1), 30)  # hiccups: back off
+                _start_cooldown(r.status_code, min(seconds, RETRY_PACE))
+                if attempt + 1 < self.tries:
+                    if attempt % 6 == 5:
+                        self.log(f"  Wikimedia keeps refusing ({r.status_code}), still retrying "
+                                 f"every {seconds}s ({self.refused} refused so far)...")
+                    time.sleep(seconds)
+                    continue
+                raise WikimediaBusy(r.status_code, told or seconds)
             r.raise_for_status()
             return r.json()
         r.raise_for_status()
@@ -120,19 +171,25 @@ class Commons:
                 cont = data["continue"]
         return files[:limit]
 
-    def depicts_files(self, qid: str, limit: int = 150) -> list[str]:
-        """Photos whose Commons structured data says they depict this Wikidata person (P180).
-        Far more complete than categories: famous people's photos sit deep in sub-categories."""
-        titles, offset = [], 0
-        while len(titles) < limit:
-            data = self._get(list="search", srsearch=f"haswbstatement:P180={qid} filetype:bitmap",
-                             srnamespace=6, srlimit=min(50, limit - len(titles)), sroffset=offset)
-            batch = [m["title"] for m in data.get("query", {}).get("search", [])]
-            titles += [t for t in batch if t not in titles]
-            if "continue" not in data or not batch:
+    def depicts_files(self, qid: str, limit: int = 150, width: int = 1024) -> list[dict]:
+        """Photos whose Commons structured data says they depict this Wikidata person (P180),
+        with their metadata. Far more complete than categories: famous people's photos sit
+        deep in sub-categories. Search and metadata come in one request per 50 photos
+        (generator=search), which halves the requests and matters under rate limits."""
+        return self._search_with_info(f"haswbstatement:P180={qid} filetype:bitmap", limit, width)
+
+    def _search_with_info(self, query: str, limit: int, width: int) -> list[dict]:
+        out, offset = [], 0
+        while len(out) < limit:
+            data = self._get(generator="search", gsrsearch=query, gsrnamespace=6,
+                             gsrlimit=min(50, limit - len(out)), gsroffset=offset,
+                             prop="imageinfo", iiprop=IMAGEINFO, iiurlwidth=width)
+            pages = sorted(data.get("query", {}).get("pages", []), key=lambda p: p.get("index", 0))
+            out += [i for i in map(_page_info, pages) if i and i["title"] not in {o["title"] for o in out}]
+            if "continue" not in data or not pages:
                 break
-            offset = data["continue"].get("sroffset", offset + len(batch))
-        return titles[:limit]
+            offset = data["continue"].get("gsroffset", offset + len(pages))
+        return out[:limit]
 
     def search_files(self, query: str, limit: int = 100) -> list[str]:
         data = self._get(list="search", srsearch=query, srnamespace=6, srlimit=min(limit, 500))
@@ -142,26 +199,30 @@ class Commons:
         out = []
         for i in range(0, len(titles), 50):
             data = self._get(titles="|".join(titles[i:i + 50]), prop="imageinfo",
-                             iiprop="url|size|mime|extmetadata", iiurlwidth=width)
-            for page in data.get("query", {}).get("pages", []):
-                info = (page.get("imageinfo") or [None])[0]
-                if not info or info.get("mime") not in OK_MIME:
-                    continue
-                meta = info.get("extmetadata", {})
-                val = lambda k: _clean(meta.get(k, {}).get("value"))  # noqa: E731
-                out.append({
-                    "title": page["title"].removeprefix("File:"),
-                    "download_url": info.get("thumburl") or info["url"],
-                    "source_url": info.get("descriptionurl"),
-                    "width": info.get("width"),
-                    "height": info.get("height"),
-                    "date": val("DateTimeOriginal") or val("DateTime"),
-                    "original_caption": val("ImageDescription") or val("ObjectName"),
-                    "author": val("Artist"),
-                    "license": val("LicenseShortName"),
-                    "categories": val("Categories"),
-                })
+                             iiprop=IMAGEINFO, iiurlwidth=width)
+            out += [i for i in map(_page_info, data.get("query", {}).get("pages", [])) if i]
         return out
+
+
+def _page_info(page: dict) -> dict | None:
+    """Download link + metadata of one file page from a prop=imageinfo answer (None if not a photo)."""
+    info = (page.get("imageinfo") or [None])[0]
+    if not info or info.get("mime") not in OK_MIME:
+        return None
+    meta = info.get("extmetadata", {})
+    val = lambda k: _clean(meta.get(k, {}).get("value"))  # noqa: E731
+    return {
+        "title": page["title"].removeprefix("File:"),
+        "download_url": info.get("thumburl") or info["url"],
+        "source_url": info.get("descriptionurl"),
+        "width": info.get("width"),
+        "height": info.get("height"),
+        "date": val("DateTimeOriginal") or val("DateTime"),
+        "original_caption": val("ImageDescription") or val("ObjectName"),
+        "author": val("Artist"),
+        "license": val("LicenseShortName"),
+        "categories": val("Categories"),
+    }
 
 
 def safe_name(title: str) -> str:
@@ -232,24 +293,28 @@ def build_catalog(person: dict, limit: int = 2000, width: int = 1024, depth: int
 
     from .metadata import normalise_date
     c = Commons(log=log, patient=patient)
-    if person.get("qid") and person.get("commons_category"):
-        # exact category from Wikidata: never fall back to the bare name, which may belong to a namesake
-        names = [person["commons_category"]]
-    else:
-        names = [person.get("commons_category"), person["name"],
-                 *[a for a in person.get("aliases", []) if " " in a]]
-    category = c.resolve_category(names) or person.get("commons_category") or person["name"]
-    titles = []
-    if person.get("qid"):  # photos tagged as depicting this person, then the category
-        titles = c.depicts_files(person["qid"], limit=limit)
-        log(f"  {len(titles)} photos tagged as depicting {person['name']}")
-    titles += [t for t in c.category_files(category, depth=depth, limit=max(0, limit - len(titles)),
-                                           max_cats=max_cats) if t not in titles]
-    if not titles:
-        log(f"  no category '{category}', falling back to search")
-        titles = c.search_files(person["name"], limit=min(limit, 500))
+    infos = []
+    if person.get("qid"):  # photos tagged as depicting this person (comes with metadata)
+        infos = c.depicts_files(person["qid"], limit=limit, width=width)
+        log(f"  {len(infos)} photos tagged as depicting {person['name']}")
+    category = person.get("commons_category") or person["name"]
+    if len(infos) < limit:  # top up from the category (skipped when "depicts" was enough)
+        if person.get("qid") and person.get("commons_category"):
+            # exact category from Wikidata: never fall back to the bare name, which may be a namesake's
+            names = [person["commons_category"]]
+        else:
+            names = [person.get("commons_category"), person["name"],
+                     *[a for a in person.get("aliases", []) if " " in a]]
+        category = c.resolve_category(names) or category
+        have = {i["title"] for i in infos}
+        titles = [t for t in c.category_files(category, depth=depth, limit=limit - len(infos),
+                                              max_cats=max_cats) if t.removeprefix("File:") not in have]
+        if not titles and not infos:
+            log(f"  no category '{category}', falling back to search")
+            titles = c.search_files(person["name"], limit=min(limit, 500))
+        infos += c.file_info(titles, width)
     files = []
-    for info in c.file_info(titles, width):
+    for info in infos:
         if min(info["width"] or 0, info["height"] or 0) < min_side:
             continue
         date, year = normalise_date(info.get("date"))

@@ -50,7 +50,8 @@ AUTO_PEOPLE = os.getenv("FS_AUTO_PEOPLE", "1") != "0"
 WIKIDATA_API = os.getenv("FS_WIKIDATA_API", "https://www.wikidata.org/w/api.php")
 AUTO_MAX_FILES = int(os.getenv("FS_AUTO_MAX_FILES", 150))     # catalog size for a new person
 AUTO_MAX_CATEGORIES = int(os.getenv("FS_AUTO_MAX_CATEGORIES", 8))  # sub-categories visited for a new person
-AUTO_DOWNLOADS = int(os.getenv("FS_AUTO_DOWNLOADS", 12))      # photos downloaded to learn the face
+AUTO_DOWNLOADS = int(os.getenv("FS_AUTO_DOWNLOADS", 12))      # photos per download round to learn the face
+AUTO_MAX_DOWNLOADS = int(os.getenv("FS_AUTO_MAX_DOWNLOADS", 36))  # more rounds until 5 clear faces, up to this
 
 # Wikimedia asks every API client to identify itself. Put your own contact here.
 WIKI_USER_AGENT = os.getenv(

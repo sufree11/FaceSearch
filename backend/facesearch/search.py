@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import math
 import random
 import threading
 import time
@@ -17,6 +18,7 @@ from collections import defaultdict
 import numpy as np
 
 from . import config, live, llm, onboard, parse, store, wikidata
+from .commons import WikimediaBusy
 from .faces import FaceEngine, Gallery, decode_image, load_people
 from .indexer import load_gallery
 
@@ -213,19 +215,44 @@ class SearchService:
         name = parsed.get("lookup")
         if not name:
             return
+        key = onboard.job_key(name)
+        job = onboard.pending(key)
+        if job:  # still being learned in the background
+            parsed["lookup_error"] = "still learning in the background"
+            parsed["lookup_pending"] = job["label"]
+            parsed["lookup_minutes"] = int((time.time() - job["since"]) // 60)
+            parsed["lookup_confirmed"] = job["confirmed"]
+            parsed["lookup_in_archive"] = not job["confirmed"] and self._archive_mentions(name)
+            return
+        failed = onboard.take_failure(key)
+        if failed:  # the background attempt didn't work out; asking again retries
+            parsed["lookup_error"] = failed
+            return
+        hints, years = parsed.get("lookup_hints", []), (parsed.get("year_from"), parsed.get("year_to"))
+        names = tuple(n for n in (parsed.get("lookup_titled"), name) if n)  # "tunku abdul rahman" first
+
+        def later(label: str, wd: dict | None = None, why: str = ""):
+            onboard.learn_later(self, key, label, wd=wd, names=names, hints=hints, years=years)
+            parsed["lookup_error"] = why or "learning in the background"
+            parsed["lookup_pending"] = label
+            parsed["lookup_confirmed"] = wd is not None
+            parsed["lookup_in_archive"] = wd is None and self._archive_mentions(name)
+
         yield f"Looking up “{name}” on Wikidata…"
         try:
-            hints, years = parsed.get("lookup_hints", []), (parsed.get("year_from"), parsed.get("year_to"))
             wd = None
-            if parsed.get("lookup_titled"):  # "tunku abdul rahman" before plain "abdul rahman"
-                wd = wikidata.lookup(parsed["lookup_titled"], hints, years)
-            wd = wd or wikidata.lookup(name, hints, years)
+            for n in names:
+                wd = wd or wikidata.lookup(n, hints, years)
+        except WikimediaBusy as e:
+            later(names[0].title(), why=str(e))  # "tunku abdul rahman" -> "Tunku Abdul Rahman"
+            return
         except Exception:
             parsed["lookup_error"] = "could not reach Wikidata"
             return
         if not wd:
             parsed["lookup_error"] = "not on Wikidata"
             return
+        parsed["lookup_confirmed"] = True  # a real person on Wikidata, however it was typed
         known = next((p for p in self.people if p.get("qid") == wd["qid"]), None)
         if known:
             pid = known["id"]
@@ -234,6 +261,12 @@ class SearchService:
             yield f"Found {wd['name']}{desc}. Learning their face from Wikimedia Commons…"
             try:
                 pid = onboard.learn(self, wd)
+            except WikimediaBusy as e:
+                later(wd["name"], wd, why=str(e))
+                return
+            except onboard.LearnerBusy:
+                later(wd["name"], wd, why="busy learning someone else")
+                return
             except onboard.OnboardError as e:
                 parsed["lookup_error"] = f"{e} (tried: {wd['name']}{desc})"
                 return
@@ -241,11 +274,29 @@ class SearchService:
         parsed["people"] = [pid]
         parsed["names"] = [self.names.get(pid, wd["name"])]
 
+    def _archive_mentions(self, name: str) -> bool:
+        """True if some photo's text already contains most words of `name` ("pasar malam" in a
+        description): then it's probably a description to search for, not a person's name."""
+        words = [w for w in parse.norm(name).split() if len(w) > 2]
+        if not words:
+            return False
+        need = math.ceil(len(words) * 0.6)  # "robert downey": both words, not just "robert"
+        for r in self.rows.values():
+            toks = set(parse.norm(r["doc_text"] or "").split())
+            if sum(w in toks for w in words) >= need:
+                return True
+        return False
+
     @staticmethod
     def _unknown_name(parsed: dict) -> bool:
-        """A clearly named person ("Anne Hathaway") we couldn't find or learn: say so instead of
-        showing unrelated photos from a meaning-based search."""
-        return bool(parsed.get("lookup_error") and parsed.get("lookup_is_name") and not parsed["people"])
+        """A person we couldn't find or learn (yet): say so instead of showing unrelated photos
+        from a meaning-based search. A person is: written with capitals ("Anne Hathaway"),
+        confirmed by Wikidata, or being looked up in the background ("robert downey jr") when
+        the archive's own descriptions don't use those words."""
+        if parsed["people"] or not parsed.get("lookup_error"):
+            return False
+        return bool(parsed.get("lookup_is_name") or parsed.get("lookup_confirmed")
+                    or (parsed.get("lookup_pending") and not parsed.get("lookup_in_archive")))
 
     def _no_result(self, parsed: dict, images: list[dict]) -> str | None:
         if images:
@@ -254,6 +305,28 @@ class SearchService:
             return (f"Maaf, tiada gambar yang sepadan dalam arkib, dan tiada tokoh awam bernama "
                     f"“{parsed['lookup']}” di Wikidata.\nSorry, no matching photos in the archive, and no "
                     f"public figure called “{parsed['lookup']}” on Wikidata.")
+        if parsed.get("lookup_pending") and not parsed["people"]:
+            who = parsed["lookup_pending"]
+            if parsed["lookup_error"] == "busy learning someone else":
+                ms, en = "saya sedang mempelajari tokoh lain", "I'm still learning someone else"
+            else:
+                ms = "Wikimedia sedang mengehadkan permintaan dari sambungan ini"
+                en = "Wikimedia is limiting requests from this connection right now"
+            if parsed.get("lookup_confirmed"):
+                ms_do, en_do = f"mempelajari wajah {who}", f"learning {who}'s face"
+            else:  # Wikidata hasn't answered yet, so we don't know who it is
+                ms_do, en_do = f"mencari “{who}” di Wikidata", f"looking up “{who}” on Wikidata"
+            mins = parsed.get("lookup_minutes")
+            if mins is None:  # just started
+                ms_when, en_when = "", ""
+            elif mins < 1:
+                ms_when, en_when = " (bermula kurang seminit lalu)", " (started under a minute ago)"
+            else:
+                ms_when, en_when = f" (bermula {mins} minit lalu)", f" (started {mins} min ago)"
+            return (f"Saya sedang {ms_do} di latar belakang{ms_when}, kerana {ms}. "
+                    f"Tanya lagi dalam beberapa minit.\n"
+                    f"I'm {en_do} in the background{en_when}, because {en}. "
+                    f"Ask again in a few minutes.")
         if parsed.get("lookup_error") and not parsed["people"]:
             return (f"Maaf, saya tidak dapat mencari “{parsed['lookup']}”: {parsed['lookup_error']}.\n"
                     f"Sorry, I couldn't search for “{parsed['lookup']}”: {parsed['lookup_error']}.")
