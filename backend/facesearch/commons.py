@@ -17,7 +17,7 @@ import requests
 
 from . import config
 
-API = config.COMMONS_API
+API = COMMONS = config.COMMONS_API
 OK_MIME = {"image/jpeg", "image/png", "image/webp"}
 TAG_RE = re.compile(r"<[^>]+>")
 IMAGEINFO = "url|size|mime|extmetadata"
@@ -38,9 +38,8 @@ class WikimediaBusy(requests.HTTPError):
     """Wikimedia asked us to slow down (HTTP 429/503 with Retry-After) and the caller can't wait."""
 
     def __init__(self, status: int, retry_after: float):
-        self.status, self.retry_after = status, max(1, round(retry_after))
         super().__init__(f"Wikimedia is limiting requests from this connection (HTTP {status}); "
-                         f"try again in about {self.retry_after} s")
+                         f"try again in about {max(1, round(retry_after))} s")
 
 
 # Wikimedia's API rate limits (2026) are shared by every wiki: a 503 from Commons means Wikidata
@@ -67,6 +66,73 @@ def _start_cooldown(status: int, seconds: float):
         _cooldown["status"] = status
 
 
+# ---------------------------------------------------------------- optional login (bot password)
+# One shared session per API (Commons, Wikidata), logged in once with the bot password from
+# backend/.env when there is one. Requests then carry the account's session cookies, so Wikimedia's
+# rate limits apply to the account rather than to the internet connection.
+_sessions: dict[str, requests.Session] = {}
+_login: dict[str, dict] = {}  # api -> {"state": "off"|"ok"|"failed"|"retry", "detail", "next_try"}
+_sessions_lock = threading.Lock()
+LOGIN_RETRY = 60  # seconds before trying again after a temporary failure (network, 503, throttled)
+
+
+def _new_session() -> requests.Session:
+    s = requests.Session()
+    s.headers["User-Agent"] = config.WIKI_USER_AGENT
+    return s
+
+
+def session_for(api: str) -> requests.Session:
+    """The shared session for `api`, logged in if a bot password is configured."""
+    with _sessions_lock:
+        s = _sessions.setdefault(api, _new_session())
+        st = _login.get(api)
+        if not (config.WIKI_USER and config.WIKI_PASSWORD):
+            _login[api] = {"state": "off"}
+        elif st is None or (st["state"] == "retry" and time.time() >= st["next_try"]):
+            _login[api] = _log_in(s, api)
+        return s
+
+
+def _log_in(s: requests.Session, api: str) -> dict:
+    """action=login with the bot password ("Name@BotName"). Never logs the password."""
+    try:
+        r = s.post(api, data={"action": "query", "meta": "tokens", "type": "login", "format": "json"},
+                   timeout=20)
+        if r.status_code == 429 or r.status_code >= 500:
+            raise requests.HTTPError(f"HTTP {r.status_code}")
+        token = r.json()["query"]["tokens"]["logintoken"]
+        res = s.post(api, data={"action": "login", "lgname": config.WIKI_USER, "lgpassword": config.WIKI_PASSWORD,
+                                "lgtoken": token, "format": "json"}, timeout=20).json().get("login", {})
+    except (requests.RequestException, ValueError, KeyError) as e:
+        return {"state": "retry", "detail": f"could not reach Wikimedia to log in ({e})",
+                "next_try": time.time() + LOGIN_RETRY}
+    if res.get("result") == "Success":
+        return {"state": "ok", "detail": res.get("lgusername", config.WIKI_USER)}
+    if res.get("result") == "Failed":  # wrong name or password: no point retrying until it's fixed
+        return {"state": "failed", "detail": res.get("reason", "login failed")}
+    return {"state": "retry", "detail": f"login: {res.get('result', 'no answer')}",  # e.g. Throttled
+            "next_try": time.time() + LOGIN_RETRY}
+
+
+def _relogin(api: str):
+    """The session expired (Wikimedia answered 'assertuserfailed'): log in again."""
+    with _sessions_lock:
+        _login[api] = _log_in(_sessions[api], api)
+
+
+def logged_in(api: str) -> bool:
+    return _login.get(api, {}).get("state") == "ok"
+
+
+def login_status() -> dict:
+    """For /api/health and `python cli.py wikimedia`."""
+    names = {COMMONS: "commons", config.WIKIDATA_API: "wikidata"}
+    return {"configured": bool(config.WIKI_USER and config.WIKI_PASSWORD),
+            "user": config.WIKI_USER.split("@")[0] if config.WIKI_USER else None,
+            **{names.get(api, api): {k: v for k, v in st.items() if k != "next_try"} for api, st in _login.items()}}
+
+
 class Commons:
     """Polite Wikimedia API client (Commons, and Wikidata via `api=`).
 
@@ -79,11 +145,9 @@ class Commons:
         """patient=True (commands, background learning): keep retrying for up to ~7 minutes per
         request. patient=False (someone waiting in the chat): one quick retry, then raise
         WikimediaBusy so the chat can hand the work to the background learner."""
-        self.s = requests.Session()
-        self.s.headers["User-Agent"] = config.WIKI_USER_AGENT
         self.delay, self.log, self._last = delay, log, 0.0
         self.api = api or API
-        self.patient = patient
+        self.s = session_for(self.api)  # shared, and logged in when a bot password is set
         self.tries = 40 if patient else 2
         self.pace = RETRY_PACE if patient else 2   # seconds between retries
         self.timeout = 60 if patient else 15
@@ -95,8 +159,13 @@ class Commons:
     def request(self, **params) -> dict:
         """Any MediaWiki API call (also used for Wikidata)."""
         params |= {"format": "json"}
+        relogged = False
         r = None
         for attempt in range(self.tries):
+            if logged_in(self.api):
+                params["assert"] = "user"  # fail loudly instead of silently running logged out
+            else:
+                params.pop("assert", None)
             left = cooldown_left()
             if left > self.pace:  # someone else is already retrying; the chat shouldn't wait
                 raise WikimediaBusy(_cooldown["status"], left)
@@ -121,7 +190,12 @@ class Commons:
                     continue
                 raise WikimediaBusy(r.status_code, told or seconds)
             r.raise_for_status()
-            return r.json()
+            data = r.json()
+            if data.get("error", {}).get("code") == "assertuserfailed" and not relogged:
+                relogged = True  # the login session expired: log in again and repeat the request
+                _relogin(self.api)
+                continue
+            return data
         r.raise_for_status()
         return {}
 

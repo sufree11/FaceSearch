@@ -57,6 +57,26 @@ function PipelineInfo({ msg, onBrowse }) {
   )
 }
 
+// While someone is learned in the background, App.jsx polls the server; this says what's going on.
+function LearningNote({ msg }) {
+  const p = msg.parsed
+  if (!p?.lookup_pending) return null
+  const st = msg.learning
+  if (st?.state === 'unknown') {
+    return <div className="learning stopped">Background learning stopped (the server restarted). Ask again to start it.</div>
+  }
+  if (msg.learnDone) return null
+  const who = st?.label || p.lookup_pending
+  const confirmed = st?.confirmed ?? p.lookup_confirmed
+  return (
+    <div className="learning" role="status">
+      <span className="pulse" aria-hidden="true" />
+      {confirmed ? `Learning ${who}’s face` : `Looking up “${who}”`} in the background
+      {st?.minutes ? ` · ${st.minutes} min so far` : ''} · photos will appear here when it’s done
+    </div>
+  )
+}
+
 export default function Message({ msg, onOpen, onBrowse }) {
   if (msg.role === 'user') {
     return (
@@ -110,6 +130,7 @@ export default function Message({ msg, onOpen, onBrowse }) {
           onCite={(i) => msg.images[i] && onOpen(msg.images, i)}
         />
       )}
+      <LearningNote msg={msg} />
       <PipelineInfo msg={msg} onBrowse={onBrowse} />
       {msg.images.length > 0 && (
         <div className="grid">

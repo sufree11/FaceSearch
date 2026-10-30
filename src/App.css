@@ -791,6 +791,30 @@
   color: var(--text);
 }
 
+/* "Learning X's face in the background · photos will appear here" */
+.learning {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 8px 12px;
+  border: 1px dashed var(--accent-border, var(--border));
+  border-radius: 10px;
+  font-size: 14px;
+  color: var(--text-h, var(--text));
+
+  &.stopped { border-style: solid; color: var(--text); }
+
+  .pulse {
+    flex: none;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: blink 1.6s infinite ease-in-out;
+  }
+}
+
 .lightbox-info .pending-note {
   margin: -2px 0 10px;
 }

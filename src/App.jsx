@@ -33,6 +33,8 @@ function App() {
   const [view, setView] = useState('chat') // 'chat' | 'browse'
   const [browsePerson, setBrowsePerson] = useState('')
   const endRef = useRef(null)
+  const nextId = useRef(1)
+  const newId = () => nextId.current++
 
   useEffect(() => {
     api.health().then(setHealth).catch(() => setHealthError(true))
@@ -45,67 +47,115 @@ function App() {
     endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
   }, [messages.length])
 
-  const replacePending = (msg) => setMessages((m) => [...m.slice(0, -1), msg])
-  const updateLast = (fn) => setMessages((m) => [...m.slice(0, -1), fn(m[m.length - 1])])
+  // every message has an id, so an answer can be filled in later (see the learning watcher below)
+  // even after more questions were asked
+  const updateById = (id, fn) => setMessages((all) => all.map((m) => (m.id === id ? fn(m) : m)))
+  const replaceLast = (msg) => setMessages((m) => [...m.slice(0, -1), { id: newId(), ...msg }])
 
+  // ask(text): a new question. ask(text, { retryId }): run it again into an existing answer,
+  // used when a person finished being learned in the background.
   const ask = useCallback(
-    async (text) => {
-      setQuery('')
-      setBusy(true)
+    async (text, { retryId, readyLabel } = {}) => {
+      const id = retryId ?? newId()
+      if (!retryId) {
+        setQuery('')
+        setBusy(true)
+      }
       const history = messages
-        .filter((m) => m.role === 'assistant' && !m.pending && !m.streaming)
+        .filter((m) => m.role === 'assistant' && !m.pending && !m.streaming && m.id !== id)
         .map((m) => ({ role: 'assistant', content: m.text, parsed: m.parsed }))
-      setMessages((m) => [
-        ...m,
-        { role: 'user', text },
-        { role: 'assistant', pending: true, text: 'Searching faces & descriptions…' },
-      ])
+      const waiting = {
+        id,
+        role: 'assistant',
+        pending: true,
+        question: text,
+        text: readyLabel ? `${readyLabel} is ready, searching again…` : 'Searching faces & descriptions…',
+      }
+      if (retryId) updateById(id, () => waiting)
+      else setMessages((m) => [...m, { id: newId(), role: 'user', text }, waiting])
+      const fail = (message) => updateById(id, () => ({ id, role: 'error', text: message }))
       try {
         await api.chatStream(text, history, (ev) => {
           if (ev.type === 'results') {
             // photos appear straight away; the reply is written underneath.
             // A second "results" comes after a live fetch from Wikimedia Commons.
             const update = { images: ev.images, parsed: ev.parsed, timing: ev.timing, live: ev.live, status: null }
-            if (ev.parsed?.new_person || ev.live?.added) {
+            if (ev.parsed?.new_person || ev.live?.added || retryId) {
               // the archive just grew: refresh the people list and the status counts
               api.people().then(setPeople).catch(() => {})
               api.health().then(setHealth).catch(() => {})
             }
-            setMessages((all) => {
-              const last = all[all.length - 1]
-              const next = last?.streaming
-                ? { ...last, ...update }
-                : { role: 'assistant', text: '', streaming: true, ...update }
-              return [...all.slice(0, -1), next]
-            })
+            updateById(id, (m) =>
+              m.streaming
+                ? { ...m, ...update }
+                : { id, role: 'assistant', question: text, text: '', streaming: true, ...update },
+            )
           } else if (ev.type === 'status') {
-            updateLast((m) => ({ ...m, status: ev.text }))
+            updateById(id, (m) => ({ ...m, status: ev.text }))
           } else if (ev.type === 'token') {
-            updateLast((m) => ({ ...m, text: m.text + ev.text }))
+            updateById(id, (m) => ({ ...m, text: m.text + ev.text }))
           } else if (ev.type === 'done') {
-            updateLast((m) => ({ ...m, text: ev.answer, timing: ev.timing, llm: ev.llm, streaming: false }))
+            updateById(id, (m) => ({ ...m, text: ev.answer, timing: ev.timing, llm: ev.llm, streaming: false }))
           } else if (ev.type === 'error') {
-            replacePending({ role: 'error', text: ev.message })
+            fail(ev.message)
           }
         })
         // stream ended without a "done" event (e.g. backend stopped): stop the cursor
-        updateLast((m) => (m.streaming ? { ...m, streaming: false } : m))
+        updateById(id, (m) => (m.streaming ? { ...m, streaming: false } : m))
       } catch (e) {
-        replacePending({ role: 'error', text: e.message })
+        fail(e.message)
       } finally {
-        setBusy(false)
+        if (!retryId) setBusy(false)
       }
     },
     [messages],
   )
+
+  // Someone is being learned in the background ("I'm learning X's face…"): ask the server every
+  // few seconds, and when it's finished run the question again into the same answer, so the
+  // photos appear without asking twice.
+  const messagesRef = useRef(messages)
+  const askRef = useRef(ask)
+  useEffect(() => {
+    messagesRef.current = messages
+    askRef.current = ask
+  }, [messages, ask])
+  const watched = messages.filter((m) => m.role === 'assistant' && !m.pending && !m.streaming && m.parsed?.lookup_pending && m.parsed?.lookup_key && !m.learnDone)
+  const watchedIds = watched.map((m) => m.id).join(',')
+  useEffect(() => {
+    if (!watchedIds) return undefined
+    const tick = async () => {
+      const current = messagesRef.current.filter((m) => watchedIds.split(',').includes(String(m.id)))
+      for (const m of current) {
+        if (m.learnDone || m.pending || m.streaming) continue
+        let st
+        try {
+          st = await api.learning(m.parsed.lookup_key)
+        } catch {
+          continue // backend briefly unreachable: try again next tick
+        }
+        if (st.state === 'pending') {
+          updateById(m.id, (x) => ({ ...x, learning: st }))
+        } else if (st.state === 'unknown') {
+          updateById(m.id, (x) => ({ ...x, learnDone: true, learning: st })) // e.g. server restarted
+        } else {
+          const label = m.learning?.label || m.parsed.lookup_pending
+          updateById(m.id, (x) => ({ ...x, learnDone: true }))
+          askRef.current(m.question, { retryId: m.id, readyLabel: st.state === 'done' ? label : null })
+        }
+      }
+    }
+    const timer = setInterval(tick, 5000)
+    return () => clearInterval(timer)
+  }, [watchedIds])
 
   const searchByFace = async (file) => {
     setBusy(true)
     const preview = URL.createObjectURL(file)
     setMessages((m) => [
       ...m,
-      { role: 'user', text: 'Who is this? Find more photos.', upload: preview },
-      { role: 'assistant', pending: true, text: 'Detecting and matching faces…' },
+      { id: newId(), role: 'user', text: 'Who is this? Find more photos.', upload: preview },
+      { id: newId(), role: 'assistant', pending: true, text: 'Detecting and matching faces…' },
     ])
     try {
       const res = await api.faceSearch(file)
@@ -127,9 +177,9 @@ function App() {
           ? ` Here are ${res.images.length} archive photos with the same face.`
           : ' No archive photos contain this face.'
       }
-      replacePending({ role: 'assistant', text, images: res.images, parsed: null })
+      replaceLast({ role: 'assistant', text, images: res.images, parsed: null })
     } catch (e) {
-      replacePending({ role: 'error', text: e.message })
+      replaceLast({ role: 'error', text: e.message })
     } finally {
       setBusy(false)
     }
@@ -225,8 +275,8 @@ function App() {
         </section>
       ) : (
         <main className="chat">
-          {messages.map((msg, i) => (
-            <Message key={i} msg={msg} onOpen={openViewer} onBrowse={openBrowse} />
+          {messages.map((msg) => (
+            <Message key={msg.id} msg={msg} onOpen={openViewer} onBrowse={openBrowse} />
           ))}
           <div ref={endRef} />
         </main>

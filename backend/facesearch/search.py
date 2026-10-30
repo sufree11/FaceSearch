@@ -216,6 +216,7 @@ class SearchService:
         if not name:
             return
         key = onboard.job_key(name)
+        parsed["lookup_key"] = key  # the website polls /api/learning?key=... while it's pending
         job = onboard.pending(key)
         if job:  # still being learned in the background
             parsed["lookup_error"] = "still learning in the background"
@@ -324,9 +325,9 @@ class SearchService:
             else:
                 ms_when, en_when = f" (bermula {mins} minit lalu)", f" (started {mins} min ago)"
             return (f"Saya sedang {ms_do} di latar belakang{ms_when}, kerana {ms}. "
-                    f"Tanya lagi dalam beberapa minit.\n"
+                    f"Gambar akan muncul di sini apabila siap.\n"
                     f"I'm {en_do} in the background{en_when}, because {en}. "
-                    f"Ask again in a few minutes.")
+                    f"The photos will appear here once it's done.")
         if parsed.get("lookup_error") and not parsed["people"]:
             return (f"Maaf, saya tidak dapat mencari “{parsed['lookup']}”: {parsed['lookup_error']}.\n"
                     f"Sorry, I couldn't search for “{parsed['lookup']}”: {parsed['lookup_error']}.")

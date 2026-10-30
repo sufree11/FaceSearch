@@ -1,4 +1,4 @@
-"""FaceSearch API.  Run:  uvicorn server:app --reload --port 8000"""
+"""FaceSearch API.  Run:  python server.py   (http://127.0.0.1:8000)"""
 from __future__ import annotations
 
 import json
@@ -30,8 +30,10 @@ class ChatIn(BaseModel):
 
 @app.get("/api/health")
 def health():
+    from facesearch.commons import login_status
     return {"ollama": llm.status(), "index": svc.stats(),
-            "face_models": config.YUNET_FILE.exists() and config.SFACE_FILE.exists()}
+            "face_models": config.YUNET_FILE.exists() and config.SFACE_FILE.exists(),
+            "wikimedia": login_status()}
 
 
 @app.get("/api/people")
@@ -95,6 +97,14 @@ def image(image_id: int):
     if not rec:
         raise HTTPException(404, "Not found")
     return rec
+
+
+@app.get("/api/learning")
+def learning(key: str):
+    """Is a person still being learned in the background? The website asks every few seconds and
+    re-runs the question once the state is "done" or "failed"."""
+    from facesearch import onboard
+    return onboard.status(key)
 
 
 @app.get("/api/random")

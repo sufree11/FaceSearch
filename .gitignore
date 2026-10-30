@@ -29,3 +29,4 @@ backend/data/
 backend/models/*.onnx
 __pycache__/
 *.pyc
+backend/.env

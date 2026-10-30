@@ -19,13 +19,9 @@ export const api = {
   health: () => request('/api/health'),
   people: () => request('/api/people'),
   random: () => request('/api/random'),
+  // is a person still being learned in the background? {state: 'pending'|'done'|'failed'|'unknown', label, minutes}
+  learning: (key) => request(`/api/learning?${new URLSearchParams({ key })}`),
   images: (params) => request(`/api/images?${new URLSearchParams(params)}`),
-  chat: (message, history) =>
-    request('/api/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message, history }),
-    }),
   // Streams the reply: calls onEvent({type: 'results' | 'token' | 'done' | 'error', ...}) as events arrive.
   chatStream: async (message, history, onEvent) => {
     const res = await fetch('/api/chat/stream', {

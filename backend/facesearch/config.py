@@ -3,6 +3,20 @@ import os
 from pathlib import Path
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
+
+
+def _load_env_file(path: Path):
+    """KEY=VALUE lines from backend/.env (kept out of git) become environment variables,
+    unless already set. Used for the Wikimedia bot password."""
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        key, sep, value = line.strip().partition("=")
+        if sep and key and not key.startswith("#"):
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+_load_env_file(BACKEND_DIR / ".env")
 DATA_DIR = Path(os.getenv("FS_DATA_DIR", BACKEND_DIR / "data"))
 RAW_DIR = DATA_DIR / "raw"          # downloaded / your own photos, one folder per person
 CATALOG_DIR = DATA_DIR / "catalog"  # list of every Commons file + date per person (no photos)
@@ -58,6 +72,11 @@ WIKI_USER_AGENT = os.getenv(
     "FS_WIKI_USER_AGENT",
     "FaceSearch/0.1 (https://github.com/sufree11/FaceSearch; internship learning project)",
 )
+
+# Optional Wikimedia login with a bot password (Special:BotPasswords), set in backend/.env.
+# Logged in, Wikimedia's rate limits follow your account instead of your internet connection.
+WIKI_USER = os.getenv("FS_WIKI_USER", "")          # e.g. "Yourname@FaceSearch"
+WIKI_PASSWORD = os.getenv("FS_WIKI_PASSWORD", "")
 
 for d in (DATA_DIR, RAW_DIR, GALLERY_DIR, MODELS_DIR, CATALOG_DIR):
     d.mkdir(parents=True, exist_ok=True)

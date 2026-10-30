@@ -71,6 +71,7 @@ def learn(svc, wd: dict, log=print, patient: bool = False) -> str:
 _jobs: queue.Queue = queue.Queue()
 _pending: dict[str, dict] = {}  # key -> {"label", "since", "confirmed": found on Wikidata yet}
 _failed: dict[str, str] = {}    # key -> why the last background attempt failed
+_done: dict[str, str] = {}      # key -> person id learned in the background (for status())
 _worker: threading.Thread | None = None
 _worker_lock = threading.Lock()
 
@@ -81,6 +82,22 @@ def job_key(name: str) -> str:
 
 def pending(key: str) -> dict | None:
     return _pending.get(key)
+
+
+def status(key: str) -> dict:
+    """What the website polls while someone is learned in the background:
+    {"state": "pending", "label", "minutes"} | {"state": "done"} | {"state": "failed"} |
+    {"state": "unknown"} (no such job, e.g. the server was restarted). Reading it changes nothing:
+    the next question still reports a failure (take_failure) or finds the person."""
+    job = _pending.get(key)
+    if job:
+        return {"state": "pending", "label": job["label"], "confirmed": job["confirmed"],
+                "minutes": int((time.time() - job["since"]) // 60)}
+    if key in _failed:
+        return {"state": "failed"}
+    if key in _done:
+        return {"state": "done"}
+    return {"state": "unknown"}
 
 
 def take_failure(key: str) -> str | None:
@@ -98,6 +115,7 @@ def learn_later(svc, key: str, label: str, wd: dict | None = None, names: tuple 
             return False
         _pending[key] = {"label": label, "since": time.time(), "confirmed": wd is not None}
         _failed.pop(key, None)
+        _done.pop(key, None)
         _jobs.put({"key": key, "wd": wd, "names": names, "hints": hints, "years": years})
         if _worker is None or not _worker.is_alive():
             _worker = threading.Thread(target=_work, args=(svc, log), daemon=True, name="learner")
@@ -117,7 +135,7 @@ def _work(svc, log):
                 _failed[key] = "not on Wikidata"
             else:
                 _pending[key].update(label=wd["name"], confirmed=True)  # "Robert Downey Jr."
-                learn(svc, wd, log=log, patient=True)
+                _done[key] = learn(svc, wd, log=log, patient=True)
         except OnboardError as e:
             _failed[key] = str(e)
         except WikimediaBusy:
@@ -186,11 +204,8 @@ def _learn_person(svc, wd: dict, pid: str, log=print, patient: bool = False) -> 
                     portrait = info[0] | {"file": safe_name(info[0]["title"]), "norm_date": d, "year": y}
     except WikimediaBusy:
         raise  # the caller decides: tell the user, or learn in the background
-    except requests.HTTPError as e:
+    except requests.HTTPError as e:  # 429/503 never get here: Commons raises WikimediaBusy for those
         code = e.response.status_code if e.response is not None else "?"
-        if code == 429:
-            raise OnboardError("Wikimedia Commons is limiting requests right now (HTTP 429). "
-                               "Wait a minute and ask again") from e
         raise OnboardError(f"Wikimedia Commons answered with an error (HTTP {code})") from e
     except requests.RequestException as e:
         raise OnboardError(f"could not reach Wikimedia Commons ({e.__class__.__name__})") from e

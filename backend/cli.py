@@ -9,6 +9,7 @@
   python cli.py redescribe                 regenerate AI descriptions (keeps faces)
   python cli.py evaluate                   face recognition accuracy
   python cli.py forget abdul-rahman        remove a wrongly learned person
+  python cli.py wikimedia                  check the Wikimedia login (backend/.env) and rate limit
   python cli.py ask "Bagi gambar Tun Mahathir"   test a query without the website
 """
 from __future__ import annotations
@@ -73,9 +74,6 @@ def cmd_catalog(a):
         print(f"  {len(files)} files on Commons, {len(files) - len(new)} downloaded, "
               f"{len(new)} available for live search" + (f"  ({top}{', ...' if len(years) > 8 else ''})" if top else ""))
     print("\nLive search will now fetch from these lists when the archive has too few photos.")
-    if "set FS_WIKI_USER_AGENT" in config.WIKI_USER_AGENT:
-        print("Tip: Wikimedia throttles anonymous clients. Identify yourself to get fewer '429' errors, e.g.\n"
-              '  set FS_WIKI_USER_AGENT=FaceSearch/0.1 (internship project; your-email@example.com)')
 
 
 def cmd_gallery(a):
@@ -127,6 +125,51 @@ def cmd_forget(a):
             pass
 
 
+def cmd_wikimedia(_):
+    """Check the Wikimedia login from backend/.env, and how many requests get through right now."""
+    import time
+
+    from facesearch import commons
+    if not (config.WIKI_USER and config.WIKI_PASSWORD):
+        print("No Wikimedia login set: requests are anonymous.\n"
+              "To log in, put FS_WIKI_USER and FS_WIKI_PASSWORD in backend/.env (see backend/.env.example).\n")
+    for name, api in (("Commons", config.COMMONS_API), ("Wikidata", config.WIKIDATA_API)):
+        c = commons.Commons(api=api, log=lambda *a: None, patient=False)
+        st = commons.login_status().get(name.lower(), {})
+        if st.get("state") == "ok":
+            print(f"{name}: logged in as {st['detail']}")
+        elif st.get("state") in ("failed", "retry"):
+            print(f"{name}: NOT logged in - {st['detail']}")
+        else:
+            print(f"{name}: anonymous")
+        try:
+            info = c.request(action="query", meta="userinfo", uiprop="groups|editcount")["query"]["userinfo"]
+            if "anon" in info:
+                print("  Wikimedia sees: an anonymous visitor")
+            else:
+                print(f"  Wikimedia sees: {info['name']} ({info.get('editcount', 0)} edits; "
+                      f"groups: {', '.join(info.get('groups', []))})")
+        except requests.RequestException as e:
+            print(f"  could not ask Wikimedia: {e}")
+
+    print("\nSending 10 small test requests to Commons, one per second...")
+    s, ok = commons.session_for(config.COMMONS_API), 0
+    data = {"action": "query", "meta": "siteinfo", "format": "json"}
+    if commons.logged_in(config.COMMONS_API):
+        data["assert"] = "user"
+    for _ in range(10):
+        try:
+            r = s.post(config.COMMONS_API, data=data, timeout=20)
+            ok += r.ok and "error" not in r.json()
+        except (requests.RequestException, ValueError):
+            pass
+        time.sleep(1)
+    who = "logged in" if commons.logged_in(config.COMMONS_API) else "anonymous"
+    print(f"{ok} of 10 went through ({who}).")
+    if ok < 8:
+        print("Wikimedia is limiting this connection: new people will be learned in the background.")
+
+
 def cmd_evaluate(_):
     from facesearch.faces import FaceEngine
     from facesearch.indexer import evaluate, load_gallery
@@ -172,6 +215,7 @@ def main():
     r.add_argument("--force", action="store_true", help="redo photos that already look fine")
     r.set_defaults(fn=cmd_redescribe)
     sub.add_parser("evaluate").set_defaults(fn=cmd_evaluate)
+    sub.add_parser("wikimedia", help="check the Wikimedia login and rate limit").set_defaults(fn=cmd_wikimedia)
     fg = sub.add_parser("forget", help="remove a person learned from Wikidata")
     fg.add_argument("person_id", help="id from data/people_auto.json, e.g. abdul-rahman")
     fg.add_argument("--delete-photos", action="store_true", help="also delete their downloaded photos")

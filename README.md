@@ -112,9 +112,9 @@ it has nothing for), FaceSearch fetches more from Wikimedia Commons on the spot:
 Without internet, or with `FS_LIVE_FETCH=0`, it silently uses the archive only. On a laptop CPU a live
 search adds roughly 5-15 seconds; describing each new photo in the background takes 20-90 seconds.
 Running `python cli.py catalog` again only does people not catalogued yet (e.g. after a failure); use
-`--refresh` now and then to pick up new uploads on Commons. Wikimedia throttles anonymous clients
-("429 Too Many Requests"); the command waits and retries, and setting `FS_WIKI_USER_AGENT` to something
-with your contact (e.g. `FaceSearch/0.1 (internship project; you@example.com)`) reduces it.
+`--refresh` now and then to pick up new uploads on Commons. Since 2026 Wikimedia rate-limits its API
+per connection ("503"/"429" with Retry-After); FaceSearch retries every few seconds, and logging in with a
+free account (see [Wikimedia login](#4-wikimedia-login-optional)) makes the limit follow your account instead.
 
 ### New public figures from Wikidata
 
@@ -125,15 +125,17 @@ learns them on the spot:
    accepted, i.e. a public figure, and every word you typed must match their name or an alias (so
    "Obama" finds Barack Obama, not the Japanese city of Obama).
 2. **Learn the face.** From Wikidata come the official portrait (P18) and the Commons category. FaceSearch
-   searches Commons for photos tagged as *depicting* the person (their Wikidata id), adds their category,
-   downloads the portrait plus ~11 likely portraits, and keeps as reference faces the clear single-face
-   photos that match the portrait. Titles typed with the name ("Tunku Abdul Rahman") are searched first.
+   searches Commons for photos tagged as *depicting* the person (their Wikidata id), adds their category if
+   needed, downloads likely portraits in rounds of 12 (up to 36), and keeps as reference faces the photos
+   whose main face matches the portrait, or, if the portrait doesn't match, the face that keeps
+   reappearing. Titles typed with the name ("Tunku Abdul Rahman") are searched first.
 3. **Save and search.** The person is added to `data/people_auto.json` (your `people.json` is untouched),
    the photos are indexed, every face already in the archive is re-checked (so they're recognised in old
    photos too), and the search runs as normal, including live search for more photos.
 
 The first question about a new person takes roughly 10-30 seconds; after that they're like anyone in
-`people.json`. Turn it off with `FS_AUTO_PEOPLE=0`. If it learned the wrong namesake, remove them with
+`people.json`. When Wikimedia is limiting your connection, the answer comes back at once and the person
+is learned in the background (about 2 minutes); the website then fills the photos into that answer. Turn it off with `FS_AUTO_PEOPLE=0`. If it learned the wrong namesake, remove them with
 `python cli.py forget <id>` (ids are in `data/people_auto.json`; add `--delete-photos` to also delete
 their downloaded photos).
 
@@ -203,6 +205,21 @@ npm run dev
 
 Open http://localhost:5173. The status pill at the top shows whether the backend, Ollama and the index are ready.
 
+### 4. Wikimedia login (optional)
+
+Wikimedia limits anonymous API use per internet connection, so on a busy connection new people are
+learned in the background. Logged in, the limit follows your account instead:
+
+1. Create a free account at https://commons.wikimedia.org (Log in › Create account).
+2. Logged in, go to https://www.mediawiki.org/wiki/Special:BotPasswords, enter a bot name such as
+   `FaceSearch` and create it, leaving the permission boxes unticked (FaceSearch only reads). Wikimedia
+   shows a username like `Yourname@FaceSearch` and a password **once**.
+3. Copy `backend/.env.example` to `backend/.env` and put both in it. `backend/.env` is in `.gitignore`,
+   so the password never goes to GitHub.
+4. Restart `python server.py`, then check with `python cli.py wikimedia`.
+
+The bot password can only do what you ticked, and you can revoke it on the same page at any time.
+
 ---
 
 ## Adding people or your own photos
@@ -229,7 +246,8 @@ Environment variables (see `backend/facesearch/config.py`):
 | `FS_CHAT_MODEL`        | `qwen2.5:3b`   | Any Ollama chat model                              |
 | `FS_EMBED_MODEL`       | `bge-m3`       | Re-index with `--force` after changing             |
 | `FS_TOP_K`             | `6`            | Photos per answer                                  |
-| `FS_WIKI_USER_AGENT`   | generic        | Wikimedia asks for a contact in the user agent     |
+| `FS_WIKI_USER_AGENT`   | `FaceSearch/0.1 (github link)` | Wikimedia asks for a contact in the user agent |
+| `FS_WIKI_USER`, `FS_WIKI_PASSWORD` | empty | Bot password for the Wikimedia login, set in `backend/.env` |
 | `FS_LIVE_FETCH`        | `1`            | `0` turns off live search from Wikimedia Commons   |
 | `FS_AUTO_PEOPLE`       | `1`            | `0` stops learning new public figures from Wikidata |
 | `FS_LIVE_MAX`          | `12`           | Most photos downloaded per live search             |
